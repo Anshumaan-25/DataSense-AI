@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Environment
+.env
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# DuckDB data files (optional, un-ignore if persisting shared data)
+data/*.duckdb.tmp
+data/*.duckdb.wal
+
+# IDE
+.vscode/
+.idea/
+*.swp
