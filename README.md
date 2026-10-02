@@ -1,6 +1,6 @@
 # DataSense AI ⚡
 
-**Phase 1**: Production-grade Text-to-SQL system powered by DuckDB, TPC-H analytical benchmark data, AST query safety validation via `sqlglot`, and multi-provider LLM support (Google Gemini & OpenAI) wrapped in an interactive Streamlit UI..
+**Phase 1**: Production-grade Text-to-SQL system powered by DuckDB, TPC-H analytical benchmark data, AST query safety validation via `sqlglot`, and multi-provider LLM support (Google Gemini & OpenAI) wrapped in an interactive Streamlit UI.
 
 ---
 
