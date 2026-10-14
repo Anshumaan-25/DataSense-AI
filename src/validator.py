@@ -162,3 +162,26 @@ def validate_sql(
                 )
 
     return True, "Valid SELECT query"
+
+
+def is_security_violation(validation_message: str) -> bool:
+    """Check if a validation failure message represents a security policy violation.
+
+    Security violations include attempts to use DDL/DML (DROP, DELETE, UPDATE, etc.),
+    external file reading, file path replacement scans, unauthorized tables, or
+    multi-statement chaining attacks. These must NOT be retried in a self-correction loop.
+    """
+    if not validation_message:
+        return False
+    msg_lower = validation_message.lower()
+    security_keywords = (
+        "prohibited",
+        "unauthorized table",
+        "multiple sql statements",
+        "modifications and external file operations",
+        "direct file system access",
+        "reading external files",
+        "modifications and administrative commands",
+    )
+    return any(keyword in msg_lower for keyword in security_keywords)
+

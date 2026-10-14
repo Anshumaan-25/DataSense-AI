@@ -1,0 +1,102 @@
+# DataSense AI - TPC-H Business Metric & Rule Catalog
+# Domain dictionary mapping natural language business concepts to precise SQL expressions and join paths.
+
+metrics:
+  - id: "net_revenue"
+    name: "Net Revenue"
+    type: "aggregation"
+    formula: "SUM(l_extendedprice * (1 - l_discount))"
+    tables:
+      - "lineitem"
+    description: "Net sales revenue after deducting all customer discounts."
+    aliases:
+      - "revenue"
+      - "sales"
+      - "net sales"
+      - "total revenue"
+      - "net amount"
+
+  - id: "gross_revenue"
+    name: "Gross Revenue"
+    type: "aggregation"
+    formula: "SUM(l_extendedprice)"
+    tables:
+      - "lineitem"
+    description: "Gross total revenue before applying any discounts."
+    aliases:
+      - "gross sales"
+      - "undiscounted revenue"
+      - "total gross revenue"
+      - "extended price total"
+
+  - id: "discount_loss"
+    name: "Discount Loss"
+    type: "aggregation"
+    formula: "SUM(l_extendedprice * l_discount)"
+    tables:
+      - "lineitem"
+    description: "Total dollar amount lost due to price discounts."
+    aliases:
+      - "discounts given"
+      - "total discounts"
+      - "discount amount"
+      - "price reduction"
+
+  - id: "tax_amount"
+    name: "Tax Amount"
+    type: "aggregation"
+    formula: "SUM(l_extendedprice * (1 - l_discount) * l_tax)"
+    tables:
+      - "lineitem"
+    description: "Total taxes collected on net discounted line items."
+    aliases:
+      - "tax"
+      - "total tax"
+      - "tax collected"
+      - "sales tax"
+
+  - id: "item_margin"
+    name: "Item Margin"
+    type: "aggregation"
+    formula: "SUM(l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity)"
+    tables:
+      - "lineitem"
+      - "partsupp"
+    join_condition: "lineitem.l_partkey = partsupp.ps_partkey AND lineitem.l_suppkey = partsupp.ps_suppkey"
+    description: "Profit margin on sold items calculated as net revenue minus total supplier cost. Requires composite join between lineitem and partsupp on partkey and suppkey."
+    aliases:
+      - "profit"
+      - "margin"
+      - "profit margin"
+      - "item profit"
+      - "gross margin"
+
+filters:
+  - id: "urgent_orders"
+    name: "Urgent Orders"
+    type: "filter"
+    condition: "o_orderpriority = '1-URGENT'"
+    tables:
+      - "orders"
+    description: "Restricts records to orders marked with top priority ('1-URGENT')."
+    aliases:
+      - "urgent"
+      - "urgent priority"
+      - "high priority"
+      - "priority orders"
+      - "1-urgent"
+
+  - id: "german_customers"
+    name: "German Customers"
+    type: "filter"
+    condition: "n_name = 'GERMANY'"
+    tables:
+      - "customer"
+      - "nation"
+    join_condition: "customer.c_nationkey = nation.n_nationkey"
+    description: "Filters customers located in Germany by joining customer to nation table."
+    aliases:
+      - "germany"
+      - "german"
+      - "customers in germany"
+      - "german market"
