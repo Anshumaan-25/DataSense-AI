@@ -4,7 +4,6 @@ Production-grade Text-to-SQL system powered by **DuckDB**, **ChromaDB Schema-Awa
 
 ---
 
-
 ## 🏗️ Architecture
 
 ```
