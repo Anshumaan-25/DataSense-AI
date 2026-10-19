@@ -220,4 +220,3 @@ Try asking the assistant:
 - *"SELECT * FROM read_csv('/etc/passwd');"* *(Trigger AST file-read rejection)*
 - *"DROP TABLE customer;"* *(Trigger AST DDL rejection)*
 
-:)
