@@ -44,16 +44,30 @@ Production-grade Text-to-SQL system powered by **DuckDB**, **ChromaDB Schema-Awa
 │  3. DuckDB Analytics Engine (database.py)              │
 │     • In-process analytical execution                  │
 │     • Runtime Binder/Catalog error → Loop to Repair    │
+│                                                        │
+│  4. Fast-Path 2-Stage Semantic Validator (semantic.py) │
+│     • Stage 1: Deterministic Heuristics (<1ms)         │
+│       - Zero-row & casing mismatch check               │
+│       - Cartesian join & row explosion check           │
+│       - Metric formula omission detection              │
+│     • Stage 2: LLM Semantic Judge                      │
+│       - Output shape & column alignment verification   │
+│       - Non-conforming results → Loop to Repair        │
 │     • Execution Success → Return PipelineResult        │
 └────────────────────────────────────────────────────────┘
        │
        ▼
- [ Interactive Streamlit UI (app.py) ]
-  • Interactive Clarification Card (Radio + Default)
-  • Clarified Intent Badges & Formula cards
-  • Attempt Status Badges (First-Try vs. Auto-Repaired)
-  • Collapsible Self-Correction & Repair History
-  • Interactive DataFrame & Execution Telemetry
+ ┌───────────────────────────────────────────────────────┐
+ │ Streamlit UI & Evaluation Dashboard (app.py)          │
+ │  • Tab 1: 💬 Query Assistant                          │
+ │    - Interactive Clarification Card                   │
+ │    - Self-Correction & Repair History Telemetry       │
+ │    - Interactive DataFrame & Export                   │
+ │  • Tab 2: 📊 Evaluation Benchmark                    │
+ │    - Execution Accuracy (EX) Benchmark Suite         │
+ │    - Pass@1 vs. Repaired Pass@N Comparison            │
+ │    - Latency & Token Telemetry Breakdown              │
+ └───────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -63,28 +77,35 @@ Production-grade Text-to-SQL system powered by **DuckDB**, **ChromaDB Schema-Awa
 ```
 DataSense AI/
 ├── data/
-│   ├── tpch.duckdb          # Persisted DuckDB instance with TPC-H benchmark tables
-│   └── metrics.yaml         # Business metric dictionary (aggregation formulas & filter rules)
+│   ├── tpch.duckdb              # Persisted DuckDB instance with TPC-H benchmark tables
+│   ├── metrics.yaml             # Business metric dictionary (aggregation formulas & filter rules)
+│   └── benchmark_queries.json   # 20 diverse TPC-H evaluation benchmark queries
+├── scripts/
+│   └── run_benchmark.py         # Standalone CLI evaluation & benchmark suite
 ├── src/
-│   ├── __init__.py          # Package initialization
-│   ├── config.py            # Environment variables, provider settings, and paths
-│   ├── database.py          # DuckDB connection manager, TPC-H generator & schema extractor
-│   ├── validator.py         # sqlglot-based AST query safety validator & file-read blocker
-│   ├── retriever.py         # ChromaDB semantic vector search for metrics & schema
-│   ├── ambiguity.py         # 3-Tier intent ambiguity classifier & clarification agent
-│   ├── generator.py         # LLM prompt construction with RAG context & repair reflection
-│   ├── pipeline.py          # Bounded self-correction repair state machine (N ≤ 3)
-│   └── app.py               # Modern Streamlit web app with interactive clarification modal
+│   ├── __init__.py              # Package initialization
+│   ├── config.py                # Environment variables, provider settings, and paths
+│   ├── database.py              # DuckDB connection manager, TPC-H generator & schema extractor
+│   ├── validator.py             # sqlglot-based AST query safety validator & file-read blocker
+│   ├── retriever.py             # ChromaDB semantic vector search for metrics & schema
+│   ├── ambiguity.py             # 3-Tier intent ambiguity classifier & clarification agent
+│   ├── generator.py             # LLM prompt construction with RAG context & repair reflection
+│   ├── semantic.py              # 2-Stage silent execution & semantic validation engine
+│   ├── pipeline.py              # Bounded self-correction repair state machine (N ≤ 3)
+│   ├── evaluator.py             # DataFrame normalizer, EX comparator & benchmark harness
+│   └── app.py                   # Streamlit app: Query Assistant + Evaluation Benchmark tabs
 ├── tests/
 │   ├── __init__.py
-│   ├── test_database.py     # Tests for TPC-H setup, schema extractor, and query execution
-│   ├── test_generator.py    # Tests for SQL extraction and error handling
-│   ├── test_retriever.py    # Tests for ChromaDB indexing, semantic search & thresholding
-│   ├── test_validator.py    # Tests for AST safety validation, file blocking & whitelisting
-│   ├── test_repair.py       # Tests for self-correction loop, compiler hints & security abort
-│   └── test_ambiguity.py    # Tests for 3-tier taxonomy, fallback parser & clarification flow
-├── .env.example             # Template for API keys and configuration
-├── requirements.txt         # Core dependencies (duckdb, chromadb, sqlglot, streamlit, pyyaml)
+│   ├── test_database.py         # Tests for TPC-H setup, schema extractor, and query execution
+│   ├── test_generator.py        # Tests for SQL extraction and error handling
+│   ├── test_retriever.py        # Tests for ChromaDB indexing, semantic search & thresholding
+│   ├── test_validator.py        # Tests for AST safety validation, file blocking & whitelisting
+│   ├── test_repair.py           # Tests for self-correction loop, compiler hints & security abort
+│   ├── test_ambiguity.py        # Tests for 3-tier taxonomy, fallback parser & clarification flow
+│   ├── test_semantic.py         # Tests for zero-row, casing, cartesian & metric omission checks
+│   └── test_evaluator.py        # Tests for dataframe normalization, EX metrics & benchmark runner
+├── .env.example                 # Template for API keys and configuration
+├── requirements.txt             # Core dependencies (duckdb, chromadb, sqlglot, streamlit, pyyaml)
 └── README.md
 ```
 
@@ -183,7 +204,7 @@ Run the full pytest suite:
 pytest tests/ -v
 ```
 
-All 63 tests cover:
+All 104 tests cover:
 - TPC-H table generation and idempotency.
 - Schema extraction (dictionary and prompt-ready DDL string).
 - Valid query execution and query error handling.
@@ -207,6 +228,12 @@ All 63 tests cover:
 - 3-Tier intent ambiguity taxonomy classification (`CLEAR`, `SOFT_DEFAULT`, `HARD_AMBIGUITY`).
 - Resilient JSON parsing and graceful fallback on malformed model responses.
 - Interactive user clarification persistence across the self-correction repair loop.
+- Fast deterministic semantic validation: zero-row uppercase literal casing mismatch repair.
+- Semantic validation: Cartesian product & row explosion detection ($10\times$ baseline threshold).
+- Semantic validation: Catalog metric omission detection against retrieved context.
+- DataFrame normalization: column casing, whitespace stripping, numeric rounding ($\epsilon=10^{-2}$), null coercion, type-stable sorting.
+- Execution Accuracy (EX) comparator: unordered multi-row matching, column name independence, shape mismatch rejection.
+- Benchmark suite: Pass@1 vs Pass@N tracking, category breakdown, token and latency telemetry reporting.
 
 ---
 
