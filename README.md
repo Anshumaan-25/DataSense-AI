@@ -246,7 +246,3 @@ Try asking the assistant:
 - *"What are the top 5 customers by total account balance?"*
 - *"SELECT * FROM read_csv('/etc/passwd');"* *(Trigger AST file-read rejection)*
 - *"DROP TABLE customer;"* *(Trigger AST DDL rejection)*
-
-
-:)
-
