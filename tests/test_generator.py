@@ -36,8 +36,11 @@ def test_extract_sql_plain_text():
     assert extracted == "SELECT count(*) FROM lineitem;"
 
 
-def test_generate_sql_missing_keys_raises():
+def test_generate_sql_missing_keys_raises(monkeypatch):
     """Verify generate_sql raises ValueError when no API keys are configured."""
+    from src import generator
+    from src.config import Settings
+    monkeypatch.setattr(generator, "settings", Settings(gemini_api_key="", openai_api_key=""))
     with pytest.raises(ValueError) as exc_info:
         generate_sql("Who are the top customers?", "CREATE TABLE customer (c_custkey BIGINT);")
     assert "API key" in str(exc_info.value)
