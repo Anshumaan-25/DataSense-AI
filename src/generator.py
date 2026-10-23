@@ -57,18 +57,31 @@ def _call_gemini(
     api_key: str,
     system_prompt: str = SYSTEM_PROMPT,
 ) -> str:
-    """Invoke Google Gemini model using the official google-genai SDK."""
+    """Invoke Google Gemini model using the official google-genai SDK with retry on transient errors."""
+    import time
     from google import genai
 
     client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model_name,
-        contents=[
-            system_prompt,
-            user_prompt,
-        ],
-    )
-    return response.text or ""
+    last_err = None
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    system_prompt,
+                    user_prompt,
+                ],
+            )
+            return response.text or ""
+        except Exception as e:
+            last_err = e
+            if ("503" in str(e) or "429" in str(e) or "UNAVAILABLE" in str(e)) and attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise e
+    if last_err:
+        raise last_err
+    return ""
 
 
 def _call_openai(

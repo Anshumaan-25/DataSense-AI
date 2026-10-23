@@ -207,15 +207,30 @@ class AmbiguityClassifier:
                 from google.genai import types
 
                 client = genai.Client(api_key=settings.gemini_api_key)
-                response = client.models.generate_content(
-                    model=settings.gemini_model,
-                    contents=[AMBIGUITY_SYSTEM_PROMPT, user_prompt],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.0,
-                    ),
-                )
-                raw_response = response.text or ""
+                import time
+                last_err = None
+                raw_response = ""
+                for attempt in range(3):
+                    try:
+                        response = client.models.generate_content(
+                            model=settings.gemini_model,
+                            contents=[AMBIGUITY_SYSTEM_PROMPT, user_prompt],
+                            config=types.GenerateContentConfig(
+                                response_mime_type="application/json",
+                                temperature=0.0,
+                            ),
+                        )
+                        raw_response = response.text or ""
+                        last_err = None
+                        break
+                    except Exception as e:
+                        last_err = e
+                        if ("503" in str(e) or "429" in str(e) or "UNAVAILABLE" in str(e)) and attempt < 2:
+                            time.sleep(1.5 * (attempt + 1))
+                            continue
+                        raise e
+                if last_err:
+                    raise last_err
             elif active_provider == "openai":
                 if not settings.openai_api_key:
                     return AmbiguityResult(
