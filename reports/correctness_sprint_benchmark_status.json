@@ -1,0 +1,26 @@
+{
+  "artifact_type": "live_benchmark_attempt_status",
+  "status": "INCOMPLETE_PROVIDER_FAILURE",
+  "recorded_at_utc": "2026-10-29T15:30:55.279800+00:00",
+  "provider": "gemini",
+  "model": "gemini-3.8-flash",
+  "protocol": "single_trajectory_v1",
+  "benchmark_sha256": "3d6422f872953c302b48635c4b3a0e011eaad6dd7f7a35e6c63f3479f1daa224",
+  "planned_tasks": 20,
+  "planned_ex_eligible_tasks": 18,
+  "completed_task_results": 0,
+  "pass_at_1_accuracy_pct": null,
+  "pass_at_n_accuracy_pct": null,
+  "observations": [
+    "The configured Gemini model metadata request succeeded.",
+    "A separate content-generation probe with a 15000ms HTTP timeout and one SDK attempt returned ServerError: 504 DEADLINE_EXCEEDED.",
+    "The full CLI benchmark initialized DuckDB and the persistent retriever, then stalled generating SQL for the first task.",
+    "The stalled CLI process was interrupted with SIGINT (exit code 130); no completed accuracy report was produced."
+  ],
+  "offline_verification": {
+    "passed": 225,
+    "failed": 0,
+    "duration_seconds": 6.11
+  },
+  "retry_command": "/opt/homebrew/Caskroom/miniconda/base/bin/python3 scripts/run_benchmark.py --read-only --output reports/correctness_sprint_benchmark.json"
+}

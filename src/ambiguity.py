@@ -25,6 +25,7 @@ class AmbiguityResult:
     clarification_prompt: str = ""
     options: List[Dict[str, str]] = field(default_factory=list)
     default_interpretation: str = ""
+    classification_succeeded: bool = True
 
 
 AMBIGUITY_SYSTEM_PROMPT = """You are a Senior Data Analyst and Intent Clarification Agent for a DuckDB analytics platform.
@@ -42,8 +43,9 @@ Your task is to analyze a natural language user question in the context of the d
    - The query leaves minor operational choices unstated (e.g., missing sort order or row limit), but the analytical goal is obvious.
    - Safe defaults exist (e.g., default to LIMIT 10, or order by date descending).
    - Do NOT interrupt the user.
-   - Example: "Show orders" -> Default to: "SELECT * FROM orders ORDER BY o_orderdate DESC LIMIT 10;"
-   - Example: "List customers" -> Default to: "SELECT * FROM customer LIMIT 10;"
+   - For browsing previews, use deterministic defaults: latest orders by o_orderdate DESC, then o_orderkey DESC, LIMIT 10; customers by c_custkey ASC, LIMIT 10.
+   - Example: "Show orders" -> Default to: "SELECT * FROM orders ORDER BY o_orderdate DESC, o_orderkey DESC LIMIT 10;"
+   - Example: "List customers" -> Default to: "SELECT * FROM customer ORDER BY c_custkey ASC LIMIT 10;"
    - Classification: is_ambiguous = false, provide default_interpretation.
 
 3. "HARD_AMBIGUITY":
@@ -75,6 +77,7 @@ def parse_ambiguity_json(raw_text: str) -> AmbiguityResult:
             is_ambiguous=False,
             ambiguity_type="CLEAR",
             reasoning="Empty LLM response, defaulting to CLEAR.",
+            classification_succeeded=False,
         )
 
     clean_text = raw_text.strip()
@@ -87,6 +90,8 @@ def parse_ambiguity_json(raw_text: str) -> AmbiguityResult:
         # Try to find { ... } block directly
         start_idx = clean_text.find("{")
         end_idx = clean_text.rfind("}")
+        if start_idx >= 0 and end_idx >= start_idx:
+            clean_text = clean_text[start_idx:end_idx + 1]
     try:
         data = json.loads(clean_text)
     except Exception as exc:
@@ -94,6 +99,7 @@ def parse_ambiguity_json(raw_text: str) -> AmbiguityResult:
             is_ambiguous=False,
             ambiguity_type="CLEAR",
             reasoning=f"Fallback on invalid JSON: {exc}",
+            classification_succeeded=False,
         )
 
     if not isinstance(data, dict):
@@ -101,11 +107,12 @@ def parse_ambiguity_json(raw_text: str) -> AmbiguityResult:
             is_ambiguous=False,
             ambiguity_type="CLEAR",
             reasoning="Parsed JSON is not an object, defaulting to CLEAR.",
+            classification_succeeded=False,
         )
 
-    ambiguity_type = str(data.get("ambiguity_type", "CLEAR")).upper()
+    ambiguity_type = str(data.get("ambiguity_type", "")).upper()
     if ambiguity_type not in ("CLEAR", "SOFT_DEFAULT", "HARD_AMBIGUITY"):
-        ambiguity_type = "CLEAR"
+        return AmbiguityResult(False, "CLEAR", reasoning="Invalid ambiguity classification.", classification_succeeded=False)
 
     is_ambiguous = ambiguity_type == "HARD_AMBIGUITY"
     reasoning = str(data.get("reasoning", ""))
@@ -124,6 +131,13 @@ def parse_ambiguity_json(raw_text: str) -> AmbiguityResult:
                 options.append({"label": opt, "details": ""})
 
     default_interpretation = str(data.get("default_interpretation", ""))
+    succeeded = True
+    if ambiguity_type == "SOFT_DEFAULT" and not default_interpretation.strip():
+        succeeded = False
+        reasoning = "SOFT_DEFAULT response omitted its default interpretation."
+    if ambiguity_type == "HARD_AMBIGUITY" and len(options) < 2:
+        succeeded = False
+        reasoning = "HARD_AMBIGUITY response omitted usable clarification options."
 
     return AmbiguityResult(
         is_ambiguous=is_ambiguous,
@@ -132,6 +146,7 @@ def parse_ambiguity_json(raw_text: str) -> AmbiguityResult:
         clarification_prompt=clarification_prompt,
         options=options,
         default_interpretation=default_interpretation,
+        classification_succeeded=succeeded,
     )
 
 
@@ -190,6 +205,7 @@ class AmbiguityClassifier:
                     is_ambiguous=False,
                     ambiguity_type="CLEAR",
                     reasoning=f"Custom classifier fallback on exception: {exc}",
+                    classification_succeeded=False,
                 )
 
         # Call configured LLM provider
@@ -202,6 +218,7 @@ class AmbiguityClassifier:
                         is_ambiguous=False,
                         ambiguity_type="CLEAR",
                         reasoning="Gemini API key not configured, bypassing classifier.",
+                        classification_succeeded=False,
                     )
                 from google import genai
                 from google.genai import types
@@ -237,6 +254,7 @@ class AmbiguityClassifier:
                         is_ambiguous=False,
                         ambiguity_type="CLEAR",
                         reasoning="OpenAI API key not configured, bypassing classifier.",
+                        classification_succeeded=False,
                     )
                 from openai import OpenAI
 
@@ -256,6 +274,7 @@ class AmbiguityClassifier:
                     is_ambiguous=False,
                     ambiguity_type="CLEAR",
                     reasoning="No API key detected, bypassing classifier.",
+                    classification_succeeded=False,
                 )
 
             return parse_ambiguity_json(raw_response)
@@ -266,4 +285,5 @@ class AmbiguityClassifier:
                 is_ambiguous=False,
                 ambiguity_type="CLEAR",
                 reasoning=f"Fallback on classifier exception: {exc}",
+                classification_succeeded=False,
             )

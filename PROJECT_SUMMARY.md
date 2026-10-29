@@ -1,8 +1,8 @@
 # DataSense AI — Comprehensive System Summary, Technical Audit & Future Roadmap
 
-> **Document Version**: 1.0.0  
-> **Last Updated**: October 2026  
-> **Status**: Production-Ready / Phases 1–6 Implemented & Verified (104/104 Tests Passing)  
+> **Document Version**: 1.2.0<br>
+> **Last Updated**: October 29, 2026<br>
+> **Status**: Phases 1–6, Tier 1 enhancements, and correctness/evaluation implementation verified (225/225 tests passing); live benchmark incomplete due to provider deadline failure<br>
 > **Repository**: [https://github.com/Anshumaan-25/DataSense-AI.git](https://github.com/Anshumaan-25/DataSense-AI.git)
 
 ---
@@ -13,11 +13,11 @@
 
 Unlike naive LLM Text-to-SQL prototypes that hallucinate column names, fail on business formulas, silently execute arbitrary interpretations, or expose databases to prompt injection and Local File Inclusion (LFI), DataSense AI integrates:
 1. **Multi-Tier Zero-Trust AST Security Sandboxing** (`sqlglot` + DuckDB C++ lockdown).
-2. **Domain-Specific Schema & Metric Vector RAG** (`ChromaDB`).
+2. **Domain-Specific Schema & Metric Vector RAG** (`ChromaDB` persistent storage with incremental content-hash caching).
 3. **3-Tier Business Ambiguity Classification & Interactive Human-in-the-Loop Clarification** (`CLEAR`, `SOFT_DEFAULT`, `HARD_AMBIGUITY`).
-4. **Bounded Self-Correction State Machine** with compiler error reflection and loop stagnation detection.
-5. **Fast-Path 2-Stage Semantic Validator** (zero-latency heuristic casing/Cartesian explosion detection + LLM semantic judge).
-6. **Execution Accuracy (EX) Benchmarking Suite** evaluating unordered multi-row matching, Pass@1 vs Pass@3 gains, latency, and token consumption.
+4. **Bounded Self-Correction State Machine** with compiler error reflection, sample rows for conversion/type errors, loop stagnation detection, and actual per-attempt SQL/output telemetry.
+5. **2-Stage Semantic Validator** (connection-specific casing profiles, AST catalog-formula checks for requested metrics, and an optional LLM judge with explicit execution status).
+6. **Execution Accuracy (EX) Benchmarking Suite** observing Pass@1 and Pass@N from the same repair trajectory. Value-based comparison supports aliases, a global column permutation, duplicate-preserving row matching, and explicit numeric/string/order policies. Gold outputs never drive repairs. Token usage is not currently recorded.
 
 ---
 
@@ -32,6 +32,7 @@ Unlike naive LLM Text-to-SQL prototypes that hallucinate column names, fail on b
         │    • metrics_catalog (net_revenue, item_margin, etc.)│
         │    • filters_catalog (german_customers, urgent)      │
         │    • schema_catalog (table DDLs & column specs)      │
+        │    • Persistent collections + content-hash reuse    │
         └──────────────────────────────────────────────────────┘
                                    │
                                    ▼ (Retrieved Formulas & Business Rules)
@@ -45,13 +46,14 @@ Unlike naive LLM Text-to-SQL prototypes that hallucinate column names, fail on b
                                    │
                                    ▼ (Grounded Intent & Formulas)
         ┌──────────────────────────────────────────────────────┐
-        │ 3. Bounded Self-Correction Repair Engine (N ≤ 3)     │
+        │ 3. Bounded Self-Correction (default: 3 attempts)      │
         │    (src/pipeline.py)                                 │
         │                                                      │
         │   [Attempt Loop (1 .. 3)]                            │
         │   ├── 3.1 LLM SQL Generator (generator.py)           │
         │   │       • Prompt compilation with schema + RAG     │
         │   │       • Error feedback reflection on retry       │
+        │   │       • Type/conversion errors: 3 sample rows    │
         │   │                                                  │
         │   ├── 3.2 AST Safety Validator (validator.py)        │
         │   │       • Prohibited DDL/DML & file access check   │
@@ -64,11 +66,11 @@ Unlike naive LLM Text-to-SQL prototypes that hallucinate column names, fail on b
         │   │                                                  │
         │   └── 3.4 Fast-Path 2-Stage Semantic Validator       │
         │       (src/semantic.py)                              │
-        │       • Stage 1: Deterministic Heuristics (<1ms)     │
-        │         - Casing mismatch repair ('germany'->'GER')  │
+        │       • Stage 1: Deterministic Heuristics            │
+        │         - Casing from profiled database values      │
         │         - Cartesian join / row explosion detection   │
         │         - Metric formula omission detection          │
-        │       • Stage 2: LLM Output Conformance Judge        │
+        │       • Stage 2: Optional LLM Conformance Judge      │
         │       • Issue detected → Feedback loop to repair     │
         └──────────────────────────────────────────────────────┘
                                    │
@@ -86,13 +88,15 @@ Unlike naive LLM Text-to-SQL prototypes that hallucinate column names, fail on b
 
 | Phase | Module | Description | Test Coverage | Status |
 |---|---|---|---|---|
-| **Phase 1** | `src/database.py`<br>`src/validator.py` | DuckDB TPC-H auto-init, AST query safety validation via `sqlglot`, blocking DDL/DML/LFI, DuckDB C++ `SET enable_external_access = false`. | 37 tests (`test_database.py`, `test_validator.py`) | ✅ Complete |
-| **Phase 2** | `src/retriever.py`<br>`src/generator.py`<br>`data/metrics.yaml` | ChromaDB vector indexing for formulas and filters, semantic thresholding, Google Gemini & OpenAI SQL code generation. | 9 tests (`test_retriever.py`, `test_generator.py`) | ✅ Complete |
-| **Phase 3** | `src/pipeline.py` | Bounded self-correction state machine ($N \le 3$), DuckDB compiler/binder error reflection, stagnation detection, immediate security abort. | 8 tests (`test_repair.py`) | ✅ Complete |
-| **Phase 4** | `src/ambiguity.py` | 3-tier taxonomy (`CLEAR`, `SOFT_DEFAULT`, `HARD_AMBIGUITY`), structured JSON output parsing, Streamlit interactive choice card with radio buttons. | 9 tests (`test_ambiguity.py`) | ✅ Complete |
-| **Phase 5** | `src/semantic.py` | Fast deterministic heuristics (<1ms casing mismatch, Cartesian explosion detection, formula omission) + LLM semantic output conformance judge. | 8 tests (`test_semantic.py`) | ✅ Complete |
-| **Phase 6** | `src/evaluator.py`<br>`scripts/run_benchmark.py`<br>`data/benchmark_queries.json` | Execution Accuracy (EX) benchmark suite, DataFrame normalization (epsilon float tolerance, column casing, unordered multi-row matching), CLI & Streamlit Dashboard. | 33 tests (`test_evaluator.py`) | ✅ Complete |
-| **Total** | **All Modules** | **Full End-to-End Test Suite** | **104 / 104 Passing** | 🚀 **Production-Ready** |
+| **Phase 1** | `src/database.py`<br>`src/validator.py` | DuckDB TPC-H auto-init, AST safety, engine lockdown, cached low-cardinality text profiles, and authorized table sampling. | 49 tests (`test_database.py`, `test_validator.py`) | ✅ Complete |
+| **Phase 2** | `src/retriever.py`<br>`src/generator.py`<br>`data/metrics.yaml` | Persistent ChromaDB, content-hash cache invalidation and stale-entry pruning, semantic retrieval, Gemini/OpenAI generation and sample-aware repair prompts. | 21 tests (`test_retriever.py`, `test_generator.py`) | ✅ Complete |
+| **Phase 3** | `src/pipeline.py` | Bounded repair with actual per-attempt outcomes, preserved intent, selective samples, positive attempt-budget validation, stagnation detection, and immediate security abort. | 20 tests (`test_repair.py`) | ✅ Complete |
+| **Phase 4** | `src/ambiguity.py` | 3-tier taxonomy, retrieval-grounded classification, explicit fallback status, deterministic browse defaults, structured clarification UI. | 17 tests (`test_ambiguity.py`) | ✅ Complete |
+| **Phase 5** | `src/semantic.py` | Dynamic casing; requested-metric AST checks with alias/CTE/derived-column support; explicit judge status; remaining deterministic heuristics. | 45 tests (`test_semantic.py`) | ✅ Complete |
+| **Phase 6** | `src/evaluator.py`<br>`scripts/run_benchmark.py`<br>`data/benchmark_queries.json` | One-trajectory EX measurement, alias-independent value comparison, tolerance and duplicate handling, safe reference preflight, error-aware reports/CLI, deterministic top-N references. | 73 tests (`test_evaluator.py`, `test_benchmark_cli.py`) | ✅ Implementation verified; live baseline pending |
+| **Total** | **All Modules** | **Automated unit and integration suite** | **225 / 225 Passing** | ✅ **Verified offline** |
+
+**Latest verification:** 225 tests passed in 6.13 seconds immediately before committing, using the existing Conda Python 3.13.13 environment: 79 additional tests since the 146-test Tier 1 milestone, and 121 since the original 104-test baseline. Automated provider calls are mocked; persistent storage is also tested across a separate Python process. A live 20-question Gemini run was attempted but stopped during the first task after a separate generation probe returned `504 DEADLINE_EXCEEDED`. No live accuracy score is available. See `reports/correctness_sprint_benchmark_status.json`.
 
 ---
 
@@ -127,31 +131,84 @@ Unlike naive LLM Text-to-SQL prototypes that hallucinate column names, fail on b
 - **Symptom**: While Streamlit holds an active connection to `data/tpch.duckdb` in read-write mode, external concurrent terminal processes (e.g. ad-hoc CLI scripts) receive `IO Error: Could not set lock on file ... Conflicting lock is held`.
 - **Resolution**: Streamlit caches the connection via `@st.cache_resource`. Documented that CLI benchmarking and parallel scripts should execute with `read_only=True` or on an in-memory instance (`:memory:`) to prevent locking conflicts.
 
+### 4.6. Hardcoded Casing Values and Cross-Database Isolation
+- **Previous limitation**: The semantic validator assumed a fixed TPC-H uppercase vocabulary, which could suggest incorrect values for other databases.
+- **Resolution**: `init_tpch_db()` now profiles low-cardinality text columns after engine lockdown. A weak-reference cache isolates profiles by connection. Caller-supplied databases are profiled lazily; `profile_distinct_values(conn)` explicitly refreshes a profile. SQL AST scopes associate equality/IN literals with physical table columns; existing exact matches, unrelated literals, negated predicates, and ambiguous casing variants are not guessed. Empty scalar aggregates containing NULL also receive casing checks.
+
+### 4.7. Persistent Index Reuse and Catalog Invalidation
+- **Previous limitation**: Application restarts rebuilt an ephemeral vector index; repeated upserts alone did not remove deleted catalog entries.
+- **Resolution**: Default clients persist to `data/chroma_storage` (configurable via `CHROMA_STORAGE_PATH`). Versioned SHA-256 hashes cover each document and its metadata. Only changed/missing entries are upserted; removed metrics, filters, and schema tables are deleted. Corpus hashes are recorded after successful collection synchronization, allowing interrupted updates to recover. Tests cover process restarts, changed formulas/schema, removals, empty catalogs, reordering, and missing-entry recovery. Generated storage is git-ignored.
+
+### 4.8. Type Repair Context and Injected Callable Compatibility
+- **Previous limitation**: Repair prompts had schema and error text but no examples of actual value formats. The broad `TypeError` compatibility fallback could also invoke a failing model function twice.
+- **Resolution**: Conversion/type errors now collect up to three rows from each referenced, authorized physical table before a repair attempt. Strings are bounded to 256 characters plus a truncation marker. CTE aliases are resolved to base tables; external reads and unauthorized queries are rejected. Samples are serialized into both provider repair prompts while preserving RAG, clarification, and error history. Sampling failures do not block repair. Signature inspection preserves legacy injected functions without retrying internal `TypeError`s.
+
+### 4.9. Local Python Interpreter Selection
+- **Observed issue**: `/usr/bin/python3` is Python 3.9.6 and lacks `pytest` on the audited machine.
+- **Resolution**: Used the already-installed `/opt/homebrew/Caskroom/miniconda/base/bin/python3` (Python 3.13.13), without installing dependencies or changing the shell configuration. The full suite passes under this interpreter.
+
+### 4.10. Metric Formula False Positives and Retrieval Alternatives
+- **Reproduced defect**: Correct net-revenue SQL using `l.l_discount` was rejected by the old substring check. Retrieved alternatives could also impose net revenue on an explicit gross-revenue question.
+- **Resolution**: Match requested metrics using catalog names/aliases with specificity (e.g. "gross revenue" takes precedence over the contained generic alias "revenue"). Clarified intent takes priority. AST comparison removes table aliases and redundant parentheses, normalizes numeric literals and commutative addition/multiplication, and follows projected CTE/derived columns. Presentation ROUND/CAST wrappers are supported. Comments, strings, unused CTEs, and WHERE subqueries do not satisfy an output formula. All five catalog formulas and custom retrieved formulas have regression coverage.
+
+### 4.11. Repair Measurement Was Confounded by Regeneration
+- **Previous defect**: Pass@1 and Pass@N came from separate initial generations, so reported lift included sampling variability and duplicate model cost.
+- **Resolution**: `PipelineAttempt` retains each actual SQL, validation outcome, output frame, and error type. One pipeline execution supplies both first-attempt and final scores. Wrong executable results do not trigger a gold-informed repair. Reports identify `single_trajectory_v1`, retain first SQL/error diagnostics, and publish the attempt budget, model/provider, dataset SHA-256, and comparison policy.
+
+### 4.12. EX Comparison Aliases, Precision, and Duplicate Rows
+- **Previous defect**: Equivalent aliases or numeric dtypes failed comparison; decimal rounding hid differences and introduced boundary artifacts; lowercasing result strings could hide incorrect data.
+- **Resolution**: Compare original values with default absolute tolerance 0.01 and relative tolerance zero, preserving string case, nulls, and duplicate multiplicity. Ignore output aliases and permit one consistent column permutation while verifying complete rows. Bipartite matching handles ambiguous numeric matches without greedy false negatives. Strict normalized column-name and case-insensitive-string policies remain explicit options. Per-task `order_sensitive: true` enables ordered rows; unordered comparison is the default. `DataFrameNormalizer` remains a legacy display utility and is not used for EX scoring.
+
+### 4.13. Classifier/Reference Failures and Nondeterministic Top-N Gold
+- **Previous defects**: Benchmark classification lacked RAG context and dropped default interpretations; classifier failures could disappear from the denominator; broken gold SQL reduced EX eligibility; tied LIMIT results depended on unspecified order.
+- **Resolution**: Use retrieval-grounded classification and preserve SOFT_DEFAULT through the entire trajectory. Predicted HARD_AMBIGUITY pauses execution and counts as an EX miss for an expected-clear task. Invalid classifier output is flagged and remains in classifier accuracy. Validate dataset IDs/schema and all EX gold SQL safely before LLM work; invalid references abort rather than shrink the denominator. Explicit top-N tie rules and deterministic order-browse defaults were added. The local audit found four parts tied at the top-10 price boundary and 66 orders on the latest date.
+- **Reporting**: Completed reports distinguish `COMPLETED` from `COMPLETED_WITH_ERRORS`; CLI exits are 0 (completed), 1 (setup/reference failure), and 2 (completed with evaluation/provider errors). Requested RAG failures are fatal instead of silently disabling retrieval. The CLI accepts `--read-only` for an existing database.
+
+### 4.14. Live Benchmark Provider Deadline Failure — Open
+- **Observed on October 29, 2026**: The configured `gemini-3.8-flash` metadata request succeeded. A bounded generation probe returned `504 DEADLINE_EXCEEDED`; the full CLI run stalled generating SQL for its first task and was interrupted (exit 130).
+- **Current status**: Zero completed task results and no live EX score. The failure status artifact records null accuracy fields and the retry command. Provider request deadlines/SDK retry limits and durable partial-run persistence remain operational improvements to implement; existing SDK defaults can stall a run.
+
 ---
 
 ## 5. Current Technical Limitations & Known Edge Cases
 
-1. **Catalog Constant Hardcoding in Heuristics**:
-   - `src/semantic.py` uses predefined sets (`TPCH_UPPERCASE_CONSTANTS`) for fast casing repairs (e.g. `'germany'` vs `'GERMANY'`).
-   - *Limitation*: For arbitrary or user-defined databases outside TPC-H, this list must be populated dynamically from table column distinct values.
+1. **Distinct-Value Profiling Bounds and Refresh**:
+   - Profiling covers `main` base-table VARCHAR/CHAR/TEXT columns, at most 100 distinct non-null values per column, and values up to 256 characters. High-cardinality columns are skipped. Result size is bounded; the underlying DISTINCT queries can still scan large tables at initialization.
+   - Profiles refresh during `init_tpch_db()` or explicit `profile_distinct_values(conn)`. Refresh after external data changes. Standalone `SemanticValidator` callers must supply `db_conn` or `distinct_value_profile` for casing checks. Direct base-table equality/IN predicates are supported; expression/derived-column lineage and ambiguous case variants are skipped.
 2. **DuckDB Concurrency Model**:
    - DuckDB is an embedded OLAP engine. While fast, simultaneous writes across multiple processes require server-mode deployment (e.g., DuckDB via MotherDuck or a lightweight database daemon) rather than direct local file mounts.
-3. **ChromaDB In-Memory Cold-Start**:
-   - The vector store currently indexes `data/metrics.yaml` and schema definitions into an in-memory ChromaDB instance on application startup (`@st.cache_resource`). While quick (~1.5s), large enterprises with thousands of metrics would require a persistent on-disk ChromaDB collection.
+3. **Local Persistent ChromaDB Scope**:
+   - Unchanged entries reuse stored embeddings. Initial indexing still needs the embedding model; hash comparison still loads catalog metadata. Use a separate storage directory for independent catalogs/databases. Collection updates are recoverable but are not an atomic transaction across all three collections; concurrent catalog writers are not coordinated.
 4. **LLM Structured Output Variations**:
    - While Gemini 3.8 and OpenAI support JSON schema constraints, prompt drift can occasionally yield extra text outside JSON fences. Fallback regex parsers are active in `ambiguity.py` and `semantic.py`, but native Pydantic schema validation should be reinforced.
+5. **Semantic Judge and Benchmark Measurement Scope**:
+   - The LLM judge remains disabled by default. UI messages now distinguish a passed judge from disabled, unavailable, and failed verification. Enabled-judge exceptions retain the existing permissive behavior but are labeled `ERROR`, never a successful judge verdict. AST formula checks establish structural agreement, not general SQL algebra equivalence or join correctness. Token telemetry remains future work.
+6. **Repair Samples**:
+   - Samples are the first up to three rows returned by DuckDB without an explicit ordering guarantee; they may not include the value that caused a conversion failure. Current pipeline authorization remains the TPC-H table whitelist. Authorized sample values are sent to the configured LLM provider during type/conversion repair.
+7. **Evaluation and Provider Limits**:
+   - EX supports scalar cells; nested/list-valued outputs raise an evaluation error. Ambiguous column permutations and tolerant row matching can be expensive for large result sets; current coverage targets the TPC-H suite. One run over 20 questions is not a generalization study. Provider timeouts and interrupted runs can prevent a completed report; the live baseline remains pending after the observed 504.
 
 ---
 
 ## 6. Future Improvements & Strategic Roadmap
 
-### Tier 1: Immediate Enhancements (Next Sprint)
-- [ ] **Dynamic Distinct Value Profiling**:
-  Automatically scan low-cardinality text columns during `init_tpch_db()` and register distinct values into a dynamic casing lookup index for the semantic validator.
-- [ ] **Persistent ChromaDB Storage**:
-  Switch ChromaDB client from ephemeral memory to a local persistent directory (`data/chroma_storage`) with hash-based caching to avoid re-indexing on restarts.
-- [ ] **Enhanced SQL Repair Context**:
-  Inject table sample rows (first 3 rows) into the prompt when a DuckDB `Conversion Error` or `Type Mismatch` occurs during self-correction.
+### Tier 1: Immediate Enhancements — Completed October 29, 2026
+- [x] **Dynamic Distinct Value Profiling**:
+  Automatically profile low-cardinality text columns during initialization and reuse connection-specific, column-aware casing values in the semantic validator. Explicit refresh and lazy profiling support caller-supplied databases.
+- [x] **Persistent ChromaDB Storage**:
+  Default to `data/chroma_storage`, reuse unchanged embeddings via versioned content hashes, reindex changed entries, and prune deleted catalog/schema entries. `CHROMA_STORAGE_PATH` overrides the storage directory.
+- [x] **Enhanced SQL Repair Context**:
+  Inject up to three bounded sample rows from referenced authorized tables for conversion errors and type mismatches, preserving business rules, clarified intent, and prior errors. Both Gemini and OpenAI prompt paths are tested.
+
+### Correctness & Trustworthy Evaluation Sprint — Implementation Completed October 29, 2026
+- [x] Requested-metric AST validation with aliases, wrappers, output lineage, and decoy regressions.
+- [x] Pass@1 and Pass@N from one observed trajectory without gold feedback into repair.
+- [x] Explicit EX policy for aliases, column permutations, numeric tolerance, string case, duplicates, nulls, and optional row ordering.
+- [x] Retrieval-grounded ambiguity classification, preserved defaults, and visible classifier failures.
+- [x] Safe gold-query preflight, stable eligibility, and deterministic top-N tie rules.
+- [x] Accurate judge UI status, auditable reports, and CLI error exits/read-only support.
+- [x] Full offline regression suite: 225/225 passing.
+- [ ] Complete the live 20-question baseline — attempted; provider deadline failure recorded in `reports/correctness_sprint_benchmark_status.json`.
 
 ### Tier 2: Mid-Term Architectural Scaling
 - [ ] **Dynamic Few-Shot In-Context Learning (RAG for SQL Exemplars)**:
@@ -181,8 +238,18 @@ source venv/bin/activate
 # 2. Verify / Edit API Configuration
 cat .env
 
-# 3. Run Complete Automated Test Suite (104 Tests)
+# 3. Run Complete Automated Test Suite (225 Tests)
 python3 -m pytest tests/ -v
+```
+
+Audited-machine fallback when system Python lacks pytest:
+```bash
+/opt/homebrew/Caskroom/miniconda/base/bin/python3 -m pytest tests/ -v
+```
+
+Optional persistent-index setting (relative paths resolve from the project root):
+```env
+CHROMA_STORAGE_PATH=data/chroma_storage
 ```
 
 ### Web Application Launch
@@ -195,6 +262,9 @@ streamlit run src/app.py
 ```bash
 # Run CLI Evaluation Benchmark Suite
 python3 scripts/run_benchmark.py --output reports/benchmark_run.json
+
+# Read-only live baseline against an existing database
+python3 scripts/run_benchmark.py --read-only --output reports/correctness_sprint_benchmark.json
 ```
 
 ---

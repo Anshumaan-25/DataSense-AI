@@ -10,6 +10,17 @@ from src.ambiguity import (
 from src.pipeline import SelfCorrectingPipeline, PipelineResult
 
 
+@pytest.mark.parametrize("raw", ["", "not json", "[]", "{}", '{"ambiguity_type": "OTHER"}', '{"ambiguity_type": "SOFT_DEFAULT"}', '{"ambiguity_type": "HARD_AMBIGUITY"}'])
+def test_invalid_classifications_are_marked_as_failures(raw):
+    assert parse_ambiguity_json(raw).classification_succeeded is False
+
+
+def test_json_with_surrounding_text_is_parsed_without_claiming_a_fallback():
+    result = parse_ambiguity_json('Analysis: {"ambiguity_type": "CLEAR"} Done.')
+    assert result.ambiguity_type == "CLEAR"
+    assert result.classification_succeeded
+
+
 def test_parse_ambiguity_json_valid():
     """Verify parsing of valid JSON output from LLM."""
     raw = """

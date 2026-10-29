@@ -10,6 +10,7 @@ Usage:
 Exit codes:
     0 — Benchmark completed (regardless of Pass@N score).
     1 — Fatal setup error (missing file, DB init failure, etc.).
+    2 — Benchmark completed with evaluation/provider errors; inspect the report.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.database import get_connection, init_tpch_db
 from src.retriever import SchemaMetricRetriever
 from src.evaluator import BenchmarkRunner, BenchmarkReport
+from src.config import settings
 
 
 # ─── ANSI colour helpers (gracefully disabled on non-TTY environments) ───────
@@ -165,17 +167,34 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable ChromaDB RAG retriever (useful for isolated LLM testing).",
     )
+    parser.add_argument("--read-only", action="store_true", help="Open an existing DuckDB file in read-only mode.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.retries < 1:
+        print(RED("✗ --retries must be at least 1."), file=sys.stderr)
+        return 1
+    provider = args.provider or settings.get_effective_provider()
+    if provider == "none" or (provider == "gemini" and not settings.gemini_api_key) or (provider == "openai" and not settings.openai_api_key):
+        print(RED("✗ Configure an API key for the selected provider before live benchmarking."), file=sys.stderr)
+        return 1
 
     # Validate benchmark file
     benchmark_path = Path(args.benchmark)
     if not benchmark_path.exists():
         print(RED(f"✗  Benchmark file not found: {benchmark_path}"), file=sys.stderr)
         return 1
+    try:
+        with benchmark_path.open(encoding="utf-8") as handle:
+            tasks = json.load(handle)
+        if not isinstance(tasks, list):
+            raise ValueError("Benchmark dataset must be a JSON list.")
+    except (OSError, ValueError) as exc:
+        print(RED(f"✗ Invalid benchmark dataset: {exc}"), file=sys.stderr)
+        return 1
+    total = len(tasks)
 
     # Ensure output directory exists
     output_path = Path(args.output)
@@ -190,7 +209,7 @@ def main() -> int:
     # Initialise DuckDB
     print("  ⏳ Initializing DuckDB TPC-H database…", end=" ", flush=True)
     try:
-        conn = get_connection()
+        conn = get_connection(read_only=args.read_only)
         init_tpch_db(conn)
         print(GREEN("done"))
     except Exception as e:
@@ -209,12 +228,8 @@ def main() -> int:
             retriever.index_catalog(str(metrics_file), schema_dict)
             print(GREEN("done"))
         except Exception as e:
-            print(YELLOW(f"skipped ({e})"))
-
-    # Load benchmark to get count
-    with open(benchmark_path, "r", encoding="utf-8") as f:
-        tasks = json.load(f)
-    total = len(tasks)
+            print(RED(f"FAILED ({e})"), file=sys.stderr)
+            return 1
 
     print(f"\n  🚀 Running {total} benchmark tasks…\n")
     wall_start = time.perf_counter()
@@ -250,6 +265,9 @@ def main() -> int:
 
     # Print summary table
     print_summary(report, output_path)
+    if report.evaluation_error_count:
+        print(RED(f"  {report.evaluation_error_count} task(s) had evaluation/provider errors; inspect the report."), file=sys.stderr)
+        return 2
     return 0
 
 

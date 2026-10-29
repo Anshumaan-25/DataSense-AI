@@ -20,7 +20,7 @@ def test_extract_string_literals():
 
 def test_check_zero_rows_casing_mismatch():
     """Verify zero-row query with lowercase constant triggers CASING_MISMATCH."""
-    validator = SemanticValidator()
+    validator = SemanticValidator(distinct_value_profile={"nation": {"n_name": ("GERMANY",)}})
     df_empty = pd.DataFrame(columns=["c_name", "n_name"])
     sql = "SELECT c_name, n_name FROM customer JOIN nation ON c_nationkey = n_nationkey WHERE n_name = 'germany';"
 
@@ -173,3 +173,136 @@ def test_pipeline_semantic_auto_repair_flow():
     assert len(result.df) == 1
     assert result.df.iloc[0]["n_name"] == "GERMANY"
     assert any(rec.get("error_type") == "SEMANTIC_VALIDATION" for rec in result.attempt_history)
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT status FROM orders WHERE status = 'readytoship'",
+    "SELECT o.status FROM orders o WHERE o.status IN ('readytoship')",
+    "SELECT status FROM orders WHERE 'readytoship' = status",
+    "WITH x AS (SELECT status FROM orders WHERE status = 'readytoship') SELECT * FROM x",
+])
+def test_dynamic_casing_uses_mixed_case_database_values(sql):
+    with duckdb.connect(":memory:") as conn:
+        conn.execute("CREATE TABLE orders AS SELECT 'ReadyToShip' AS status")
+        validator = SemanticValidator(db_conn=conn)
+        result = validator.validate_output("Show ready orders", sql, conn.execute(sql).df())
+        assert result.issue_type == "CASING_MISMATCH"
+        assert "ReadyToShip" in result.suggested_fix
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT status FROM orders WHERE status = 'unknown'",
+    "SELECT status FROM orders WHERE description = 'readytoship'",
+    "SELECT 'readytoship' FROM orders WHERE 1 = 0",
+    "SELECT status FROM orders WHERE LOWER(status) = 'readytoship' AND 1 = 0",
+    "SELECT status FROM orders WHERE status NOT IN ('readytoship') AND 1 = 0",
+    "SELECT status FROM orders WHERE status = 'ReadyToShip' AND 1 = 0",
+])
+def test_dynamic_casing_does_not_guess_unrelated_or_valid_literals(sql):
+    profile = {"orders": {"status": ("ReadyToShip",), "description": ("Other",)}}
+    result = SemanticValidator(distinct_value_profile=profile).validate_output(
+        "Show orders", sql, pd.DataFrame(columns=["status"]),
+    )
+    assert result.is_valid
+
+
+def test_case_collisions_are_not_guessed():
+    validator = SemanticValidator(distinct_value_profile={"orders": {"status": ("Ready", "READY")}})
+    result = validator.validate_output(
+        "Show ready orders", "SELECT status FROM orders WHERE status = 'ready'", pd.DataFrame(columns=["status"]),
+    )
+    assert result.is_valid
+
+
+def test_casing_detects_null_scalar_aggregate_with_escaped_literal():
+    with duckdb.connect(":memory:") as conn:
+        conn.execute("CREATE TABLE orders AS SELECT 'O''Reilly' AS publisher, 10 AS amount")
+        sql = "SELECT SUM(amount) FROM orders WHERE publisher = 'o''reilly'"
+        result = SemanticValidator(db_conn=conn).validate_output("Total amount", sql, conn.execute(sql).df())
+        assert result.issue_type == "CASING_MISMATCH"
+        assert "O'Reilly" in result.suggested_fix
+
+
+@pytest.mark.parametrize("metric,expression", [
+    ("net_revenue", "SUM(l.l_extendedprice * (1.0 - l.l_discount))"),
+    ("net_revenue", "ROUND(SUM((1 - l.l_discount) * l.l_extendedprice), 2)"),
+    ("gross_revenue", "SUM(l.l_extendedprice)"),
+    ("discount_loss", "SUM(l.l_discount * l.l_extendedprice)"),
+    ("tax_amount", "SUM(l.l_tax * ((1 - l.l_discount) * l.l_extendedprice))"),
+    ("item_margin", "SUM(l.l_extendedprice * (1 - l.l_discount) - l.l_quantity * ps.ps_supplycost)"),
+])
+def test_catalog_formulas_accept_aliases_wrappers_and_commutative_operands(metric, expression):
+    validator = SemanticValidator()
+    definition = next(item for item in validator.metrics if item["id"] == metric)
+    result = validator.validate_output(
+        f"What is the {definition['name']}?", f"SELECT {expression} AS result FROM lineitem l JOIN partsupp ps ON l.l_partkey = ps.ps_partkey",
+        pd.DataFrame({"result": [10.0]}), rag_context=metric,
+    )
+    assert result.is_valid, result.reasoning
+
+
+@pytest.mark.parametrize("sql", [
+    "WITH revenue AS (SELECT SUM(l.l_extendedprice * (1 - l.l_discount)) AS amount FROM lineitem l) SELECT r.amount FROM revenue r",
+    "SELECT r.amount FROM (SELECT SUM(l.l_extendedprice * (1 - l.l_discount)) AS amount FROM lineitem l) r",
+    "WITH revenue(amount) AS (SELECT SUM(l.l_extendedprice * (1 - l.l_discount)) FROM lineitem l) SELECT * FROM revenue",
+])
+def test_metric_formulas_follow_output_lineage(sql):
+    result = SemanticValidator().validate_output(
+        "What is net revenue?", sql, pd.DataFrame({"revenue": [10.0]}), rag_context="net_revenue",
+    )
+    assert result.is_valid, result.reasoning
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT SUM(l_extendedprice * (1 + l_discount)) FROM lineitem",
+    "SELECT SUM(l_extendedprice * (1 - l_discount)) + 1 FROM lineitem",
+    "SELECT SUM(l_extendedprice) FROM lineitem -- SUM(l_extendedprice * (1 - l_discount))",
+    "SELECT SUM(l_extendedprice), 'SUM(l_extendedprice * (1 - l_discount))' AS decoy FROM lineitem",
+    "WITH unused AS (SELECT SUM(l_extendedprice * (1 - l_discount)) AS total FROM lineitem) SELECT SUM(l_extendedprice) FROM lineitem",
+    "SELECT SUM(l_extendedprice) FROM lineitem WHERE (SELECT SUM(l_extendedprice * (1 - l_discount)) FROM lineitem) > 0",
+    "WITH revenue AS (SELECT SUM(l_extendedprice * (1 - l_discount)) AS total FROM lineitem) SELECT total + 1 FROM revenue",
+])
+def test_metric_check_rejects_wrong_arithmetic_and_non_output_decoys(sql):
+    result = SemanticValidator().validate_output(
+        "What is net revenue?", sql, pd.DataFrame({"result": [10.0]}), rag_context="net_revenue",
+    )
+    assert not result.is_valid
+    assert result.issue_type == "CATALOG_METRIC_OMISSION"
+
+
+@pytest.mark.parametrize("question,clarification,sql", [
+    ("What is gross revenue?", "", "SELECT SUM(l_extendedprice) FROM lineitem"),
+    ("How many orders?", "", "SELECT COUNT(*) FROM orders"),
+    ("What is net revenue?", "Use gross revenue", "SELECT SUM(l_extendedprice) FROM lineitem"),
+    ("Compare net revenue and gross revenue", "", "SELECT SUM(l_extendedprice * (1 - l_discount)), SUM(l_extendedprice) FROM lineitem"),
+])
+def test_retrieval_candidates_are_not_all_mandatory_metrics(question, clarification, sql):
+    result = SemanticValidator().validate_output(
+        question, sql, pd.DataFrame({"result": [10.0]}),
+        rag_context="net_revenue gross_revenue", clarified_context=clarification,
+    )
+    assert result.is_valid, result.reasoning
+
+
+def test_ast_metric_validation_uses_retrieved_custom_formula():
+    metadata = [{"kind": "metric", "id": "freight_cost", "name": "Freight Cost", "formula": "SUM(shipping_cost)"}]
+    validator = SemanticValidator()
+    for sql, expected in (("SELECT SUM(o.shipping_cost) FROM orders o", True), ("SELECT COUNT(*) FROM orders", False)):
+        result = validator.validate_output(
+            "What is freight cost?", sql, pd.DataFrame({"cost": [10.0]}), rag_metadata=metadata,
+        )
+        assert result.is_valid is expected
+
+
+@pytest.mark.parametrize("response,status,valid", [
+    ('{"is_valid": true}', "PASSED", True),
+    ('{"is_valid": false}', "REJECTED", False),
+    ('{"is_valid": "false"}', "ERROR", True),
+    ('not json', "ERROR", True),
+])
+def test_semantic_judge_status_distinguishes_verdicts_from_fallbacks(response, status, valid):
+    result = SemanticValidator(enable_llm_judge=True, judge_fn=lambda prompt: response).validate_output(
+        "How many orders?", "SELECT COUNT(*) FROM orders", pd.DataFrame({"count": [2]}),
+    )
+    assert result.is_valid is valid
+    assert result.judge_status == status

@@ -442,9 +442,15 @@ with tab_qa:
             if result.semantic_validation is not None:
                 sem = result.semantic_validation
                 if sem.issue_type == "NONE":
+                    judge_note = {
+                        "PASSED": "The LLM judge also passed.",
+                        "DISABLED": "The LLM judge is disabled.",
+                        "UNAVAILABLE": "The LLM judge was unavailable.",
+                        "ERROR": "The LLM judge could not verify this result.",
+                    }.get(sem.judge_status, "The LLM judge did not run.")
                     st.markdown(
                         '<span class="metric-badge badge-semantic">🧠 SEMANTIC PASS</span> '
-                        'Output cleared both Stage 1 (fast heuristics) and Stage 2 (LLM judge) checks.',
+                        f'Output passed deterministic checks. {judge_note}',
                         unsafe_allow_html=True,
                     )
                 else:
@@ -505,6 +511,7 @@ with tab_bench:
         "Evaluates the full DataSense AI pipeline (RAG + Ambiguity Classifier + Self-Correction + Semantic Validator) "
         "against 20 diverse TPC-H business queries. Ground truth SQL is executed **live** against the same DuckDB instance."
     )
+    st.caption("Pass@1 and Pass@N use the same initial SQL. Result comparison ignores aliases, preserves string case and duplicate rows, and uses absolute numeric tolerance 0.01.")
 
     bench_col1, bench_col2 = st.columns([2, 4])
     with bench_col1:
@@ -572,6 +579,8 @@ with tab_bench:
 
     if report is not None:
         st.write("---")
+        if report.evaluation_error_count:
+            st.warning(f"This run had {report.evaluation_error_count} evaluation/provider error(s). Review the exported diagnostics before interpreting accuracy.")
 
         # Headline metric cards
         m1, m2, m3, m4, m5 = st.columns(5)

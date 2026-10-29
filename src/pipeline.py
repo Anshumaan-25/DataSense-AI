@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -9,12 +11,56 @@ from typing import Any, Callable, Dict, List, Optional, Set
 import duckdb
 import pandas as pd
 
-from src.database import get_connection, get_schema_info, execute_query, TPCH_TABLES
+from src.database import (
+    TPCH_TABLES,
+    execute_query,
+    get_connection,
+    get_query_sample_rows,
+    get_schema_info,
+)
 from src.validator import validate_sql, is_security_violation
 from src.generator import generate_sql, generate_repaired_sql
 from src.retriever import SchemaMetricRetriever
 from src.ambiguity import AmbiguityClassifier, AmbiguityResult
 from src.semantic import SemanticValidator, SemanticValidationResult
+
+logger = logging.getLogger(__name__)
+
+
+def _call_model(fn: Callable, *args, **kwargs):
+    """Preserve injected legacy callables without retrying errors raised inside them."""
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return fn(*args, **kwargs)
+    if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        kwargs = {
+            key: value for key, value in kwargs.items()
+            if key in parameters and parameters[key].kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY,
+            )
+        }
+    return fn(*args, **kwargs)
+
+
+def _needs_type_samples(error_message: str) -> bool:
+    message = error_message.lower()
+    return any(marker in message for marker in (
+        "conversion error", "type mismatch", "cannot compare values of type",
+        "cannot mix values of type", "no function matches the given name and argument types",
+    ))
+
+
+@dataclass
+class PipelineAttempt:
+    """Observed outcome of one real generation/repair attempt; no gold feedback."""
+
+    attempt: int
+    sql: str = ""
+    success: bool = False
+    df: Optional[pd.DataFrame] = None
+    error_type: str = ""
+    error_message: str = ""
 
 
 @dataclass
@@ -35,6 +81,7 @@ class PipelineResult:
     ambiguity_result: Optional[AmbiguityResult] = None
     semantic_validation: Optional[SemanticValidationResult] = None
     was_semantically_repaired: bool = False
+    attempts: List[PipelineAttempt] = field(default_factory=list)
 
 
 def sanitize_error_message(raw_error: str) -> str:
@@ -109,14 +156,14 @@ class SelfCorrectingPipeline:
         self.repair_fn = repair_fn if repair_fn is not None else generate_repaired_sql
         self.classifier = classifier if classifier is not None else AmbiguityClassifier()
         self.semantic_validator = (
-            semantic_validator if semantic_validator is not None else SemanticValidator()
+            semantic_validator if semantic_validator is not None else SemanticValidator(db_conn=self.db_conn)
         )
 
     def check_ambiguity(
         self,
         user_question: str,
         schema_info: Optional[str] = None,
-        rag_context: str = "",
+        rag_context: Optional[str] = None,
         provider: Optional[str] = None,
     ) -> AmbiguityResult:
         """Classify user intent ambiguity and generate clarification options.
@@ -133,6 +180,14 @@ class SelfCorrectingPipeline:
         if schema_info is None:
             schema_info = get_schema_info(conn=self.db_conn, as_string=True)
 
+        if rag_context is None:
+            rag_context = ""
+            if self.retriever is not None:
+                try:
+                    rag_context, _ = self.retriever.retrieve(user_question)
+                except Exception as exc:
+                    logger.warning("Ambiguity classification has no retrieval context: %s", exc)
+
         return self.classifier.classify_intent(
             user_question=user_question,
             schema_info=schema_info,
@@ -147,287 +202,126 @@ class SelfCorrectingPipeline:
         provider: Optional[str] = None,
         clarified_context: str = "",
     ) -> PipelineResult:
-        """Execute the self-correction loop with hard bounded retries.
+        """Run one bounded trajectory, retaining actual per-attempt outcomes.
 
-        State Machine Transitions:
-        1. Retrieve RAG Context (Metrics & Schema)
-        2. Attempt Loop (attempt = 1 to max_retries):
-           - Generate SQL (Initial or Repaired with preserved clarified context)
-           - Check for Stagnation / Repeated Query
-           - AST Safety Validation
-             - If SECURITY VIOLATION: Fatal Abort (No retry)
-             - If SYNTAX ERROR: Record & Retry
-           - DuckDB Execution
-             - If SUCCESS: Return PipelineResult(success=True)
-             - If RUNTIME ERROR: Record & Retry
-        3. If all attempts exhausted: Return PipelineResult(success=False)
-
-        Args:
-            user_question: The user's natural language question or direct SQL test.
-            max_retries: Maximum number of attempts allowed (default 3).
-            provider: LLM provider override ('gemini', 'openai').
-            clarified_context: Optional user clarification of ambiguous intent.
-
-        Returns:
-            PipelineResult containing execution outcome and attempt telemetry.
+        Only compiler, safety, and semantic feedback reaches repairs. Evaluation
+        observes these outcomes after completion and never supplies gold SQL/results.
         """
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 1:
+            raise ValueError("max_retries must be a positive integer.")
         start_time = time.perf_counter()
-
+        result = PipelineResult(success=False, total_attempts=0, clarified_context=clarified_context)
         if not user_question or not user_question.strip():
-            return PipelineResult(
-                success=False,
-                error_message="Question is empty.",
-                clarified_context=clarified_context,
-            )
+            result.error_message = "Question is empty."
+            return result
 
-        # Step 1: Retrieve Schema & RAG Context
         schema_str = get_schema_info(conn=self.db_conn, as_string=True)
-        rag_context = ""
-        rag_metadata: List[Dict[str, Any]] = []
-
         if self.retriever is not None:
             try:
-                rag_context, rag_metadata = self.retriever.retrieve(
-                    user_question,
-                    top_k_metrics=2,
-                    top_k_filters=2,
-                    top_k_tables=3,
+                result.rag_context, result.rag_metadata = self.retriever.retrieve(
+                    user_question, top_k_metrics=2, top_k_filters=2, top_k_tables=3,
                 )
-            except Exception:
-                rag_context = ""
-                rag_metadata = []
+            except Exception as exc:
+                logger.warning("SQL generation has no retrieval context: %s", exc)
 
-        # Check for direct SQL bypass test
         cleaned_input = user_question.strip()
         sql_keywords = ("SELECT ", "WITH ", "DROP ", "DELETE ", "UPDATE ", "INSERT ", "ALTER ", "CREATE ")
         is_direct_sql = cleaned_input.upper().startswith(sql_keywords)
-
-        attempt_history: List[Dict[str, Any]] = []
         seen_queries: Set[str] = set()
-        current_sql = ""
-        last_error = ""
 
-        # Step 2: Bounded Attempt Loop
         for attempt in range(1, max_retries + 1):
-            # A. Generate or Repair SQL
+            result.total_attempts = attempt
+            outcome = PipelineAttempt(attempt=attempt)
+            result.attempts.append(outcome)
+
+            def record_failure(error_type: str, message: str, **detail) -> None:
+                outcome.error_type = error_type
+                outcome.error_message = message
+                result.error_message = message
+                result.attempt_history.append({
+                    "attempt": attempt, "sql": outcome.sql,
+                    "error": message, "error_type": error_type, **detail,
+                })
+
             try:
                 if attempt == 1:
-                    if is_direct_sql:
-                        current_sql = cleaned_input
-                    else:
-                        try:
-                            current_sql = self.generator_fn(
-                                user_question,
-                                schema_str,
-                                rag_context=rag_context,
-                                clarified_context=clarified_context,
-                                provider=provider,
-                            )
-                        except TypeError:
-                            current_sql = self.generator_fn(
-                                user_question,
-                                schema_str,
-                                rag_context=rag_context,
-                                provider=provider,
-                            )
+                    current_sql = cleaned_input if is_direct_sql else _call_model(
+                        self.generator_fn, user_question, schema_str,
+                        rag_context=result.rag_context, clarified_context=clarified_context,
+                        provider=provider,
+                    )
                 else:
-                    last_record = attempt_history[-1]
-                    try:
-                        current_sql = self.repair_fn(
-                            user_question=user_question,
-                            schema_info=schema_str,
-                            rag_context=rag_context,
-                            failed_sql=last_record["sql"],
-                            error_message=last_record["error"],
-                            attempt_history=attempt_history,
-                            clarified_context=clarified_context,
-                            provider=provider,
-                        )
-                    except TypeError:
-                        current_sql = self.repair_fn(
-                            user_question=user_question,
-                            schema_info=schema_str,
-                            rag_context=rag_context,
-                            failed_sql=last_record["sql"],
-                            error_message=last_record["error"],
-                            attempt_history=attempt_history,
-                            provider=provider,
-                        )
-            except Exception as gen_exc:
-                elapsed = (time.perf_counter() - start_time) * 1000
-                attempt_history.append({
-                    "attempt": attempt,
-                    "sql": current_sql,
-                    "error": str(gen_exc),
-                    "error_type": "GENERATION_FAILURE",
-                })
-                return PipelineResult(
-                    success=False,
-                    final_sql=current_sql,
-                    total_attempts=attempt,
-                    execution_time_ms=elapsed,
-                    error_message=f"Model generation error: {gen_exc}",
-                    attempt_history=attempt_history,
-                    rag_context=rag_context,
-                    rag_metadata=rag_metadata,
-                    clarified_context=clarified_context,
-                )
+                    last_record = result.attempt_history[-1]
+                    table_samples = {}
+                    if last_record["error_type"] == "DUCKDB_RUNTIME" and _needs_type_samples(last_record["error"]):
+                        try:
+                            table_samples = get_query_sample_rows(last_record["sql"], self.db_conn)
+                        except Exception as exc:
+                            logger.warning("Repair will proceed without table samples: %s", exc)
+                    current_sql = _call_model(
+                        self.repair_fn, user_question=user_question, schema_info=schema_str,
+                        rag_context=result.rag_context, failed_sql=last_record["sql"],
+                        error_message=last_record["error"], attempt_history=result.attempt_history,
+                        clarified_context=clarified_context, provider=provider, table_samples=table_samples,
+                    )
+                if not isinstance(current_sql, str):
+                    raise TypeError("The model must return a SQL string.")
+            except Exception as exc:
+                record_failure("GENERATION_FAILURE", str(exc))
+                result.error_message = f"Model generation error: {exc}"
+                break
 
-            # B. Loop Stagnation & Cycle Detection
-            normalized_sql = " ".join(current_sql.strip().split())
+            outcome.sql = current_sql
+            result.final_sql = current_sql
+            # Preserve whitespace inside literals: those queries can have different meanings.
+            normalized_sql = current_sql.strip()
             if normalized_sql in seen_queries:
-                elapsed = (time.perf_counter() - start_time) * 1000
-                stagnation_msg = (
-                    "Stagnation loop detected: the model repeated an identical SQL query "
-                    "that previously failed."
-                )
-                attempt_history.append({
-                    "attempt": attempt,
-                    "sql": current_sql,
-                    "error": stagnation_msg,
-                    "error_type": "CYCLE_STAGNATION",
-                })
-                return PipelineResult(
-                    success=False,
-                    final_sql=current_sql,
-                    total_attempts=attempt,
-                    execution_time_ms=elapsed,
-                    error_message=stagnation_msg,
-                    attempt_history=attempt_history,
-                    rag_context=rag_context,
-                    rag_metadata=rag_metadata,
-                    clarified_context=clarified_context,
-                )
+                record_failure("CYCLE_STAGNATION", "Stagnation loop detected: the model repeated an identical SQL query that previously failed.")
+                break
             seen_queries.add(normalized_sql)
 
-            # C. AST Safety Validation
             is_valid, validation_msg = validate_sql(current_sql, allowed_tables=TPCH_TABLES)
-
             if not is_valid:
-                # CRITICAL: Security Policy Violations MUST NEVER BE RETRIED
-                if is_security_violation(validation_msg):
-                    elapsed = (time.perf_counter() - start_time) * 1000
-                    attempt_history.append({
-                        "attempt": attempt,
-                        "sql": current_sql,
-                        "error": validation_msg,
-                        "error_type": "SECURITY_VIOLATION",
-                    })
-                    return PipelineResult(
-                        success=False,
-                        final_sql=current_sql,
-                        total_attempts=attempt,
-                        execution_time_ms=elapsed,
-                        error_message=validation_msg,
-                        is_security_violation=True,
-                        attempt_history=attempt_history,
-                        rag_context=rag_context,
-                        rag_metadata=rag_metadata,
-                        clarified_context=clarified_context,
-                    )
-
-                # Benign syntax error -> Retriable
-                attempt_history.append({
-                    "attempt": attempt,
-                    "sql": current_sql,
-                    "error": validation_msg,
-                    "error_type": "AST_SYNTAX",
-                })
-                last_error = validation_msg
+                result.is_security_violation = is_security_violation(validation_msg)
+                record_failure("SECURITY_VIOLATION" if result.is_security_violation else "AST_SYNTAX", validation_msg)
+                if result.is_security_violation:
+                    break
                 continue
 
-            # D. Execution against DuckDB Engine
             df, query_err = execute_query(current_sql, conn=self.db_conn)
+            if query_err is not None or df is None:
+                clean_err = sanitize_error_message(query_err or "Unknown database error")
+                result.is_security_violation = any(marker in clean_err.lower() for marker in (
+                    "permission error", "disabled by configuration",
+                ))
+                record_failure("SECURITY_VIOLATION" if result.is_security_violation else "DUCKDB_RUNTIME", clean_err)
+                if result.is_security_violation:
+                    break
+                continue
 
-            if query_err is None and df is not None:
-                # E. Semantic Validation
-                sem_res = self.semantic_validator.validate_output(
-                    user_question=user_question,
-                    sql_query=current_sql,
-                    df=df,
-                    schema_info=schema_str,
-                    rag_context=rag_context,
-                    clarified_context=clarified_context,
-                    provider=provider,
-                )
+            outcome.df = df
+            sem_res = _call_model(
+                self.semantic_validator.validate_output,
+                user_question=user_question, sql_query=current_sql, df=df,
+                schema_info=schema_str, rag_context=result.rag_context,
+                rag_metadata=result.rag_metadata, clarified_context=clarified_context,
+                provider=provider,
+            )
+            result.semantic_validation = sem_res
+            if not sem_res.is_valid:
+                record_failure("SEMANTIC_VALIDATION", f"{sem_res.reasoning} Suggested fix: {sem_res.suggested_fix}", issue_type=sem_res.issue_type)
+                continue
 
-                if not sem_res.is_valid:
-                    sem_err_msg = f"{sem_res.reasoning} Suggested fix: {sem_res.suggested_fix}"
-                    attempt_history.append({
-                        "attempt": attempt,
-                        "sql": current_sql,
-                        "error": sem_err_msg,
-                        "error_type": "SEMANTIC_VALIDATION",
-                        "issue_type": sem_res.issue_type,
-                    })
-                    last_error = sem_err_msg
-                    continue
+            outcome.success = True
+            result.success = True
+            result.df = df
+            result.error_message = None
+            break
+        else:
+            result.error_message = f"Failed to auto-repair query after {max_retries} attempts. Last error: {result.error_message}"
 
-                # SUCCESS! Both syntax and semantics are valid!
-                elapsed = (time.perf_counter() - start_time) * 1000
-                was_semantically_repaired = any(
-                    rec.get("error_type") == "SEMANTIC_VALIDATION"
-                    for rec in attempt_history
-                )
-                return PipelineResult(
-                    success=True,
-                    final_sql=current_sql,
-                    df=df,
-                    total_attempts=attempt,
-                    execution_time_ms=elapsed,
-                    attempt_history=attempt_history,
-                    rag_context=rag_context,
-                    rag_metadata=rag_metadata,
-                    clarified_context=clarified_context,
-                    semantic_validation=sem_res,
-                    was_semantically_repaired=was_semantically_repaired,
-                )
-
-            # Runtime DuckDB error -> Check if engine-level security block
-            clean_err = sanitize_error_message(query_err or "Unknown database error")
-            if (
-                "permission error" in clean_err.lower()
-                or "disabled by configuration" in clean_err.lower()
-            ):
-                elapsed = (time.perf_counter() - start_time) * 1000
-                attempt_history.append({
-                    "attempt": attempt,
-                    "sql": current_sql,
-                    "error": clean_err,
-                    "error_type": "SECURITY_VIOLATION",
-                })
-                return PipelineResult(
-                    success=False,
-                    final_sql=current_sql,
-                    total_attempts=attempt,
-                    execution_time_ms=elapsed,
-                    error_message=clean_err,
-                    is_security_violation=True,
-                    attempt_history=attempt_history,
-                    rag_context=rag_context,
-                    rag_metadata=rag_metadata,
-                    clarified_context=clarified_context,
-                )
-
-            # Benign DuckDB Runtime Binder/Parser Error -> Retriable
-            attempt_history.append({
-                "attempt": attempt,
-                "sql": current_sql,
-                "error": clean_err,
-                "error_type": "DUCKDB_RUNTIME",
-            })
-            last_error = clean_err
-
-        # Step 3: All Attempts Exhausted
-        elapsed = (time.perf_counter() - start_time) * 1000
-        return PipelineResult(
-            success=False,
-            final_sql=current_sql,
-            total_attempts=max_retries,
-            execution_time_ms=elapsed,
-            error_message=f"Failed to auto-repair query after {max_retries} attempts. Last error: {last_error}",
-            attempt_history=attempt_history,
-            rag_context=rag_context,
-            rag_metadata=rag_metadata,
-            clarified_context=clarified_context,
+        result.execution_time_ms = (time.perf_counter() - start_time) * 1000
+        result.was_semantically_repaired = result.success and any(
+            record["error_type"] == "SEMANTIC_VALIDATION" for record in result.attempt_history
         )
+        return result

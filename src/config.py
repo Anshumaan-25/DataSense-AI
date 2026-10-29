@@ -22,6 +22,9 @@ class Settings:
     duckdb_path: str = os.getenv("DUCKDB_PATH", str(BASE_DIR / "data" / "tpch.duckdb"))
     tpch_scale_factor: float = float(os.getenv("TPCH_SCALE_FACTOR", "0.1"))
 
+    # Relative paths are anchored to the repository, independent of the launch directory.
+    chroma_storage_path: Path = BASE_DIR / os.getenv("CHROMA_STORAGE_PATH", "data/chroma_storage")
+
     # LLM Configuration
     llm_provider: str = os.getenv("LLM_PROVIDER", "auto").lower()
 

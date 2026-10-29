@@ -2,13 +2,24 @@
 
 from __future__ import annotations
 
-import os
+import logging
 from pathlib import Path
 from typing import Any, Optional
+from weakref import WeakKeyDictionary
 import duckdb
 import pandas as pd
+import sqlglot
+from sqlglot import exp
+from sqlglot.optimizer.scope import traverse_scope
 
 from src.config import settings
+from src.validator import validate_sql
+
+logger = logging.getLogger(__name__)
+
+# Keep profiles isolated by connection without retaining closed/discarded databases.
+DistinctValueProfile = dict[str, dict[str, tuple[str, ...]]]
+_VALUE_PROFILES: WeakKeyDictionary = WeakKeyDictionary()
 
 # Global connection cache for singleton usage
 _GLOBAL_CONN: Optional[duckdb.DuckDBPyConnection] = None
@@ -99,7 +110,114 @@ def init_tpch_db(
     # Lock down external filesystem and network access for zero-trust security
     active_conn.execute("SET enable_external_access = false;")
 
+    # Read-only profiling also works when initializing an existing, locked-down database.
+    profile_distinct_values(active_conn)
+
     return active_conn
+
+
+def _quote_identifier(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def profile_distinct_values(
+    conn: duckdb.DuckDBPyConnection,
+    max_distinct_values: int = 100,
+    max_value_length: int = 256,
+) -> DistinctValueProfile:
+    """Refresh a connection's low-cardinality text values for semantic casing checks.
+
+    At most threshold + 1 distinct values are fetched per column. High-cardinality
+    columns and oversized strings are excluded from the in-memory profile.
+    """
+    if max_distinct_values < 1 or max_value_length < 1:
+        raise ValueError("Profiling limits must be positive.")
+
+    columns = conn.execute("""
+        SELECT c.table_name, c.column_name
+        FROM information_schema.columns c
+        JOIN information_schema.tables t
+          ON c.table_catalog = t.table_catalog
+         AND c.table_schema = t.table_schema AND c.table_name = t.table_name
+        WHERE c.table_catalog = current_database() AND c.table_schema = 'main'
+          AND t.table_type = 'BASE TABLE'
+          AND (c.data_type LIKE 'VARCHAR%' OR c.data_type LIKE 'CHAR%'
+               OR c.data_type = 'TEXT')
+        ORDER BY c.table_name, c.ordinal_position
+    """).fetchall()
+
+    profile: DistinctValueProfile = {}
+    for table_name, column_name in columns:
+        table_sql = _quote_identifier(table_name)
+        column_sql = _quote_identifier(column_name)
+        try:
+            rows = conn.execute(
+                f'SELECT DISTINCT {column_sql} FROM "main".{table_sql} '
+                f'WHERE {column_sql} IS NOT NULL LIMIT ?',
+                [max_distinct_values + 1],
+            ).fetchall()
+        except duckdb.Error as exc:
+            logger.warning("Could not profile %s.%s: %s", table_name, column_name, exc)
+            continue
+        if len(rows) > max_distinct_values:
+            continue
+        values = tuple(sorted(row[0] for row in rows if len(row[0]) <= max_value_length))
+        if values:
+            profile.setdefault(table_name.lower(), {})[column_name.lower()] = values
+
+    _VALUE_PROFILES[conn] = profile
+    return profile
+
+
+def get_distinct_value_profile(conn: duckdb.DuckDBPyConnection) -> DistinctValueProfile:
+    """Reuse initialization profiling, or lazily profile a caller-supplied database."""
+    if conn not in _VALUE_PROFILES:
+        return profile_distinct_values(conn)
+    return _VALUE_PROFILES[conn]
+
+
+def get_query_sample_rows(
+    sql_query: str,
+    conn: duckdb.DuckDBPyConnection,
+    row_limit: int = 3,
+    allowed_tables: Optional[set[str] | list[str]] = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Sample only authorized physical tables referenced by a validated query.
+
+    Generated SQL is parsed, never executed here. Quoted SELECTs against known
+    main-schema tables return at most three rows per table, with bounded strings.
+    CTE aliases and table functions are not sampled as physical tables.
+    """
+    allowed = {name.lower() for name in (TPCH_TABLES if allowed_tables is None else allowed_tables)}
+    is_valid, _ = validate_sql(sql_query, allowed_tables=allowed)
+    if not is_valid or row_limit < 1:
+        return {}
+    tree = sqlglot.parse_one(sql_query, read="duckdb")
+    referenced = {
+        source.name.lower()
+        for scope in traverse_scope(tree)
+        for source in scope.sources.values()
+        if isinstance(source, exp.Table) and source.name.lower() in allowed
+        and not source.catalog and source.db.lower() in ("", "main")
+    }
+    known_tables = get_schema_info(conn=conn)
+    samples: dict[str, list[dict[str, Any]]] = {}
+    for table_name in sorted(referenced.intersection(known_tables)):
+        try:
+            frame = conn.execute(
+                f'SELECT * FROM "main".{_quote_identifier(table_name)} LIMIT ?',
+                [min(row_limit, 3)],
+            ).df()
+        except duckdb.Error as exc:
+            logger.warning("Could not sample %s: %s", table_name, exc)
+            continue
+        records = frame.to_dict(orient="records")
+        for record in records:
+            for key, value in record.items():
+                if isinstance(value, (str, bytes, bytearray)) and len(value) > 256:
+                    record[key] = str(value[:256]) + "…"
+        samples[table_name] = records
+    return samples
 
 
 def get_schema_info(

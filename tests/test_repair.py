@@ -196,3 +196,109 @@ def test_cycle_stagnation_detection(memory_db):
     assert result.total_attempts == 2  # Aborts on attempt 2 when stagnation detected
     assert "stagnation" in result.error_message.lower()
     assert result.attempt_history[-1]["error_type"] == "CYCLE_STAGNATION"
+
+
+@pytest.mark.parametrize("failed_sql", [
+    "SELECT CAST(raw_value AS INTEGER) FROM orders",
+    "SELECT * FROM orders WHERE raw_value > 10",
+])
+def test_type_repairs_receive_only_referenced_sample_rows(failed_sql):
+    with duckdb.connect(":memory:") as conn:
+        conn.execute("CREATE TABLE orders AS SELECT 'USD 20' AS raw_value FROM range(5)")
+        conn.execute("CREATE TABLE customer AS SELECT 'unrelated' AS secret")
+        captured = []
+
+        def repair(**kwargs):
+            captured.append(kwargs)
+            return "SELECT raw_value FROM orders LIMIT 3"
+
+        result = SelfCorrectingPipeline(
+            db_conn=conn, generator_fn=lambda *a, **kw: failed_sql, repair_fn=repair,
+        ).execute_with_repair("Show order values", clarified_context="Keep original currency text")
+        assert result.success
+        assert result.total_attempts == 2
+        assert captured[0]["table_samples"] == {"orders": [{"raw_value": "USD 20"}] * 3}
+        assert captured[0]["clarified_context"] == "Keep original currency text"
+
+
+def test_ordinary_binder_errors_do_not_sample_tables(memory_db, monkeypatch):
+    from src import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "get_query_sample_rows", lambda *a, **kw: pytest.fail("unnecessary sampling"))
+    result = SelfCorrectingPipeline(
+        db_conn=memory_db,
+        generator_fn=lambda *a, **kw: "SELECT missing_column FROM orders",
+        repair_fn=lambda **kw: "SELECT o_orderkey FROM orders LIMIT 1",
+    ).execute_with_repair("Show one order")
+    assert result.success
+
+
+def test_security_rejections_do_not_sample_tables(memory_db, monkeypatch):
+    from src import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "get_query_sample_rows", lambda *a, **kw: pytest.fail("security violation sampled"))
+    result = SelfCorrectingPipeline(db_conn=memory_db).execute_with_repair("SELECT * FROM read_csv('/etc/passwd')")
+    assert result.is_security_violation
+    assert result.total_attempts == 1
+
+
+def test_sample_failure_does_not_prevent_repair(monkeypatch):
+    from src import pipeline as pipeline_module
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("sample unavailable")
+
+    monkeypatch.setattr(pipeline_module, "get_query_sample_rows", unavailable)
+    with duckdb.connect(":memory:") as conn:
+        conn.execute("CREATE TABLE orders AS SELECT 'USD 20' AS raw_value")
+
+        def repair(**kwargs):
+            assert kwargs["table_samples"] == {}
+            return "SELECT raw_value FROM orders"
+
+        result = SelfCorrectingPipeline(
+            db_conn=conn,
+            generator_fn=lambda *a, **kw: "SELECT CAST(raw_value AS INTEGER) FROM orders",
+            repair_fn=repair,
+        ).execute_with_repair("Show order values")
+        assert result.success
+
+
+def test_internal_model_type_error_is_not_reinvoked(memory_db):
+    calls = []
+
+    def generator(*args, **kwargs):
+        calls.append(1)
+        raise TypeError("failure inside the model function")
+
+    result = SelfCorrectingPipeline(db_conn=memory_db, generator_fn=generator).execute_with_repair("Show orders")
+    assert not result.success
+    assert len(calls) == 1
+    assert "failure inside the model function" in result.error_message
+
+
+def test_attempt_telemetry_keeps_initial_failure_and_actual_success(memory_db):
+    result = SelfCorrectingPipeline(
+        db_conn=memory_db,
+        generator_fn=lambda *a, **kw: "SELECT missing_column FROM orders",
+        repair_fn=lambda **kw: "SELECT o_orderkey FROM orders LIMIT 1",
+    ).execute_with_repair("Show one order")
+    assert [outcome.attempt for outcome in result.attempts] == [1, 2]
+    assert result.attempts[0].error_type == "DUCKDB_RUNTIME"
+    assert result.attempts[0].df is None and not result.attempts[0].success
+    assert result.attempts[1].success and len(result.attempts[1].df) == 1
+
+
+def test_generation_failure_records_an_attempt_without_fake_sql(memory_db):
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("provider unavailable")
+    result = SelfCorrectingPipeline(db_conn=memory_db, generator_fn=unavailable).execute_with_repair("Show orders")
+    assert len(result.attempts) == 1
+    assert result.attempts[0].sql == ""
+    assert result.attempts[0].error_type == "GENERATION_FAILURE"
+
+
+@pytest.mark.parametrize("budget", [0, -1, True, 1.5])
+def test_invalid_attempt_budgets_are_rejected(memory_db, budget):
+    with pytest.raises(ValueError, match="positive integer"):
+        SelfCorrectingPipeline(db_conn=memory_db).execute_with_repair("Show orders", max_retries=budget)

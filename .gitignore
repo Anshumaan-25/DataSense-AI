@@ -19,6 +19,7 @@ htmlcov/
 # DuckDB data files (optional, un-ignore if persisting shared data)
 data/*.duckdb.tmp
 data/*.duckdb.wal
+data/chroma_storage/
 
 # IDE
 .vscode/

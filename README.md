@@ -79,7 +79,8 @@ DataSense AI/
 ├── data/
 │   ├── tpch.duckdb              # Persisted DuckDB instance with TPC-H benchmark tables
 │   ├── metrics.yaml             # Business metric dictionary (aggregation formulas & filter rules)
-│   └── benchmark_queries.json   # 20 diverse TPC-H evaluation benchmark queries
+│   ├── benchmark_queries.json   # 20 diverse TPC-H evaluation benchmark queries
+│   └── chroma_storage/          # Generated persistent vector index (git-ignored)
 ├── scripts/
 │   └── run_benchmark.py         # Standalone CLI evaluation & benchmark suite
 ├── src/
@@ -137,7 +138,7 @@ LLM_PROVIDER=auto
 
 # Option A: Google Gemini (Recommended)
 GEMINI_API_KEY=your_gemini_api_key_here
-GEMINI_MODEL=gemini-2.5-flash
+GEMINI_MODEL=gemini-3.8-flash
 
 # Option B: OpenAI
 OPENAI_API_KEY=your_openai_api_key_here
@@ -146,6 +147,9 @@ OPENAI_MODEL=gpt-4o-mini
 # DuckDB Settings
 DUCKDB_PATH=data/tpch.duckdb
 TPCH_SCALE_FACTOR=0.1
+
+# Persistent vector index (relative to project root, or an absolute path)
+CHROMA_STORAGE_PATH=data/chroma_storage
 ```
 
 ### 3. Launch Streamlit Application
@@ -154,7 +158,11 @@ TPCH_SCALE_FACTOR=0.1
 streamlit run src/app.py
 ```
 
-The database (`data/tpch.duckdb`) is automatically initialized with TPC-H tables (`sf=0.1`) on first run, and ChromaDB indexes the metric catalog into memory.
+The database (`data/tpch.duckdb`) is automatically initialized with TPC-H tables (`sf=0.1`) on first run. ChromaDB persists metrics, filters, and schema in `data/chroma_storage`. Content hashes reuse unchanged embeddings across restarts; changed entries are reindexed and removed entries are pruned. Set `CHROMA_STORAGE_PATH` to use another directory. Relative paths resolve from the project root.
+
+Initialization also profiles low-cardinality text columns after DuckDB external access is disabled. The semantic validator uses actual column values for casing corrections, including mixed-case values outside TPC-H. Profiles contain at most 100 distinct non-null values per column and omit strings longer than 256 characters. Refresh them with `profile_distinct_values(conn)` after external data changes. Standalone validators accept `db_conn` or an explicit `distinct_value_profile`; the pipeline supplies its active connection automatically.
+
+When execution fails with a conversion or type error, the next repair prompt includes up to three sample rows from each referenced authorized table. Long text values are truncated to 256 characters plus a marker. Sampling preserves the SQL safety checks and does not run for ordinary syntax errors or security rejections. Sample values are provided to the configured LLM as data examples along with business rules, clarified intent, and error history.
 
 ---
 
@@ -204,7 +212,7 @@ Run the full pytest suite:
 pytest tests/ -v
 ```
 
-All 104 tests cover:
+All 225 tests cover:
 - TPC-H table generation and idempotency.
 - Schema extraction (dictionary and prompt-ready DDL string).
 - Valid query execution and query error handling.
@@ -215,6 +223,8 @@ All 104 tests cover:
 - AST validator rejection of direct file path replacement scans (`'data/*.parquet'`, `'/etc/passwd'`).
 - AST validator table whitelisting and CTE resolution.
 - ChromaDB indexing counts for metrics, filters, and schema collections.
+- Persistent embedding reuse across Python process restarts, incremental formula/schema updates, deleted entries, interrupted updates, and missing-entry recovery.
+- Connection-specific distinct-value profiling, high-cardinality exclusion, refresh behavior, quoted identifiers, and read-only connections.
 - Semantic RAG retrieval for compound business questions ("What is the net revenue for customers in Germany?").
 - Composite join retrieval for item margin and urgent priority.
 - Semantic distance thresholding on irrelevant queries.
@@ -223,17 +233,30 @@ All 104 tests cover:
 - Self-correction on DuckDB runtime typos (`c_namee` -> `c_name` via DuckDB compiler hints).
 - Self-correction on sqlglot AST parse errors.
 - Strict security violation immediate fatal abort (zero retries on `DROP`, `DELETE`, `read_csv`).
-- Hard loop cap enforcement ($N \le 3$) on persistent errors.
+- Configured attempt-budget enforcement (three attempts by default) on persistent errors.
 - Loop stagnation & identical query cycle detection.
 - 3-Tier intent ambiguity taxonomy classification (`CLEAR`, `SOFT_DEFAULT`, `HARD_AMBIGUITY`).
 - Resilient JSON parsing and graceful fallback on malformed model responses.
 - Interactive user clarification persistence across the self-correction repair loop.
-- Fast deterministic semantic validation: zero-row uppercase literal casing mismatch repair.
-- Semantic validation: Cartesian product & row explosion detection ($10\times$ baseline threshold).
-- Semantic validation: Catalog metric omission detection against retrieved context.
-- DataFrame normalization: column casing, whitespace stripping, numeric rounding ($\epsilon=10^{-2}$), null coercion, type-stable sorting.
-- Execution Accuracy (EX) comparator: unordered multi-row matching, column name independence, shape mismatch rejection.
-- Benchmark suite: Pass@1 vs Pass@N tracking, category breakdown, token and latency telemetry reporting.
+- Semantic validation: column-aware casing repair from profiled values, including aliases, IN predicates, escaped literals, case collisions, and NULL scalar aggregates.
+- Conversion/type repair samples: bounded rows, physical-table/CTE resolution, security boundaries, sampling failure fallback, and Gemini/OpenAI prompt integration.
+- Semantic validation: multi-table row explosion detection (more than 1,000 rows without grouping or a limit).
+- Semantic validation: requested catalog formulas compared as ASTs, including aliases, ROUND/CAST wrappers, commutative operands, CTE/derived output columns, and rejection of formula decoys outside the output.
+- Actual first-attempt telemetry, preserved ambiguity defaults, safe gold-query preflight, classifier error accounting, and CLI integration/error exits.
+- EX comparison: output aliases and column order are ignored using one global mapping; complete rows and duplicate multiplicity must match. Original numeric values use absolute tolerance 0.01 and zero relative tolerance. Nulls match nulls; string case is preserved. A task can set `order_sensitive: true` to require row order. Strict column-name or case-insensitive string comparison are explicit comparator options.
+- Benchmark suite: Pass@1 and Pass@N observe the same initial SQL and repair trajectory. Gold outputs never drive repairs. Exports include the protocol, first SQL/error, provider/model, dataset hash, comparison policy, latency, and classifier/error status. Token telemetry is not currently recorded.
+
+The legacy `DataFrameNormalizer` display utility is not used for EX scoring. The Streamlit semantic indicator states whether the optional LLM judge actually ran and passed.
+
+Run a live benchmark against an existing database with:
+
+```bash
+python3 scripts/run_benchmark.py --read-only --output reports/correctness_sprint_benchmark.json
+```
+
+CLI exit codes are 0 for completion, 1 for setup/reference errors, and 2 for a completed run with evaluation/provider errors. Top-N references include deterministic tie rules; SOFT_DEFAULT order browsing uses order date descending, then order key descending, with LIMIT 10.
+
+The October 29 live attempt stopped during the first task after a separate Gemini generation probe returned `504 DEADLINE_EXCEEDED`. Live accuracy is unmeasured; the attempted-run status is recorded in `reports/correctness_sprint_benchmark_status.json`. Offline verification passed 225 tests.
 
 ---
 

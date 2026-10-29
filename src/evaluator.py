@@ -9,27 +9,35 @@ Architecture:
 Design Decisions:
 - Ground truth SQL is EXECUTED LIVE against the same DuckDB instance at benchmark time —
   never stored as hardcoded expected values. This ensures scale-factor-agnostic EX scores.
-- Pass@1 is measured via a separate single-attempt pipeline call (max_retries=1), then the
-  full repair loop runs independently. This doubles API cost for failed-at-1 queries but
-  produces a clean, honest Pass@1 measurement without polluting the pipeline state.
+- Pass@1 and Pass@N observe the same pipeline trajectory. Gold output never drives repair.
 - Ambiguous queries (expected_ambiguity = 'HARD_AMBIGUITY') are EXCLUDED from EX measurement
   and tracked separately via Ambiguity Classifier Accuracy to avoid category errors.
-- SOFT_DEFAULT queries ARE included in EX — the pipeline applies defaults automatically.
+- SOFT_DEFAULT queries ARE included in EX with classifier defaults preserved.
+- Comparison policy and first-attempt SQL are exported for auditability.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import time
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from decimal import Decimal
+from numbers import Real
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-from src.database import get_connection, init_tpch_db, execute_query
-from src.pipeline import SelfCorrectingPipeline, PipelineResult
+from src.ambiguity import AmbiguityResult
+from src.config import settings
+from src.database import execute_query, get_connection, get_schema_info
+from src.pipeline import SelfCorrectingPipeline
 from src.retriever import SchemaMetricRetriever
+from src.validator import validate_sql
 
 
 # ---------------------------------------------------------------------------
@@ -37,7 +45,7 @@ from src.retriever import SchemaMetricRetriever
 # ---------------------------------------------------------------------------
 
 class DataFrameNormalizer:
-    """Normalizes a DataFrame into a canonical form for order-agnostic comparison.
+    """Legacy display normalization; EX uses original values via the comparator.
 
     Normalization steps (applied in sequence):
     1. Column names → lowercase, stripped of whitespace.
@@ -112,57 +120,149 @@ class DataFrameNormalizer:
 # ---------------------------------------------------------------------------
 
 class ExecutionAccuracyComparator:
-    """Compares two DataFrames for exact execution accuracy (EX).
+    """Value-based EX with a global column mapping and duplicate-preserving rows.
 
-    Comparison contract:
-    - Both DataFrames are normalized before comparison.
-    - Shape (rows × columns) must be identical.
-    - Column names (as sets) must be identical (order-agnostic).
-    - Cell values must match element-wise after both frames are column-sorted.
+    Default policy: aliases and row order are ignored; strings are case-sensitive;
+    numbers use absolute tolerance 0.01 with zero relative tolerance. Raw values are
+    compared without rounding, float coercion, or string coercion of cell types.
     """
 
-    def __init__(self) -> None:
-        self._normalizer = DataFrameNormalizer()
+    def __init__(self, atol: float = 0.01, rtol: float = 0.0,
+                 ignore_column_names: bool = True, case_sensitive_strings: bool = True):
+        if any(not math.isfinite(value) or value < 0 for value in (atol, rtol)):
+            raise ValueError("Numeric tolerances must be finite and non-negative.")
+        self.atol = Decimal(str(atol))
+        self.rtol = Decimal(str(rtol))
+        self.ignore_column_names = ignore_column_names
+        self.case_sensitive_strings = case_sensitive_strings
 
-    def compare_outputs(
-        self,
-        df_generated: pd.DataFrame,
-        df_truth: pd.DataFrame,
-    ) -> bool:
-        """Return True if both DataFrames represent equivalent result sets.
+    def policy(self) -> Dict[str, Any]:
+        return {
+            "absolute_tolerance": str(self.atol), "relative_tolerance": str(self.rtol),
+            "ignore_column_names": self.ignore_column_names,
+            "case_sensitive_strings": self.case_sensitive_strings,
+            "row_order": "unordered unless task.order_sensitive is true",
+            "duplicates": "preserved", "column_mapping": "one global permutation",
+        }
 
-        Args:
-            df_generated: DataFrame produced by the LLM-generated SQL.
-            df_truth:     DataFrame produced by the ground truth SQL.
+    def _key(self, value):
+        if isinstance(value, (list, tuple, dict, set)):
+            raise TypeError("EX comparison supports scalar cells.")
+        if pd.isna(value):
+            return ("null",)
+        if isinstance(value, bool):
+            return ("bool", value)
+        if isinstance(value, (Real, Decimal)):
+            return ("number", Decimal(str(value)))
+        if isinstance(value, str):
+            return ("string", value if self.case_sensitive_strings else value.casefold())
+        return ("scalar", value)
 
-        Returns:
-            True if normalized shape, column names, and all cell values match exactly.
-        """
+    def _cells_equal(self, left, right) -> bool:
+        a, b = self._key(left), self._key(right)
+        if a == b:
+            return True
+        if a[0] != "number" or b[0] != "number":
+            return False
+        if not a[1].is_finite() or not b[1].is_finite():
+            return False
+        return abs(a[1] - b[1]) <= self.atol + self.rtol * max(abs(a[1]), abs(b[1]))
+
+    def _rows_equal(self, left, right, ordered=False) -> bool:
+        if len(left) != len(right):
+            return False
+        if ordered:
+            return all(all(self._cells_equal(a, b) for a, b in zip(x, y)) for x, y in zip(left, right))
+        left_keys = [tuple(self._key(value) for value in row) for row in left]
+        right_keys = [tuple(self._key(value) for value in row) for row in right]
+        if Counter(left_keys) == Counter(right_keys):
+            return True
+        groups_left, groups_right = defaultdict(list), defaultdict(list)
+        for rows, keys, groups in ((left, left_keys, groups_left), (right, right_keys, groups_right)):
+            for row, keys_for_row in zip(rows, keys):
+                group = tuple(("number",) if key[0] == "number" else key for key in keys_for_row)
+                groups[group].append(row)
+        if groups_left.keys() != groups_right.keys():
+            return False
+        for group, generated in groups_left.items():
+            truth = groups_right[group]
+            if len(generated) != len(truth):
+                return False
+            adjacency = [
+                [j for j, target in enumerate(truth)
+                 if all(self._cells_equal(a, b) for a, b in zip(row, target))]
+                for row in generated
+            ]
+            # Augmenting paths, rather than greedy pairing, preserve a valid match
+            # when multiple numeric values lie within the same tolerance interval.
+            matched_left, matched_right = {}, {}
+            for start in range(len(generated)):
+                queue, parent = deque([start]), {}
+                found = None
+                while queue and found is None:
+                    index = queue.popleft()
+                    for candidate in adjacency[index]:
+                        if candidate in parent:
+                            continue
+                        parent[candidate] = index
+                        if candidate not in matched_right:
+                            found = candidate
+                            break
+                        queue.append(matched_right[candidate])
+                if found is None:
+                    return False
+                while found is not None:
+                    index = parent[found]
+                    previous = matched_left.get(index)
+                    matched_left[index] = found
+                    matched_right[found] = index
+                    found = previous
+        return True
+
+    def compare_outputs(self, df_generated: pd.DataFrame, df_truth: pd.DataFrame,
+                        order_sensitive: bool = False) -> bool:
         if df_generated is None or df_truth is None:
             return False
+        if not isinstance(df_generated, pd.DataFrame) or not isinstance(df_truth, pd.DataFrame):
+            raise TypeError("EX comparison requires DataFrames.")
+        if df_generated.shape != df_truth.shape:
+            return False
+        left = list(df_generated.itertuples(index=False, name=None))
+        right = list(df_truth.itertuples(index=False, name=None))
+        names_left = [str(name).strip().lower() for name in df_generated.columns]
+        names_right = [str(name).strip().lower() for name in df_truth.columns]
+        candidates = {}
+        for target in range(df_truth.shape[1]):
+            candidates[target] = [
+                index for index in range(df_generated.shape[1])
+                if (self.ignore_column_names or names_left[index] == names_right[target])
+                and self._rows_equal([(row[index],) for row in left], [(row[target],) for row in right], order_sensitive)
+            ]
+            candidates[target].sort(key=lambda index: names_left[index] != names_right[target])
+            if not candidates[target]:
+                return False
+        targets = sorted(candidates, key=lambda target: len(candidates[target]))
 
-        norm_gen = self._normalizer.normalize(df_generated)
-        norm_truth = self._normalizer.normalize(df_truth)
-
-        # Shape guard
-        if norm_gen.shape != norm_truth.shape:
+        def align(mapping, used):
+            if len(mapping) == len(targets):
+                return True
+            target = targets[len(mapping)]
+            tried = set()
+            for index in candidates[target]:
+                if index in used:
+                    continue
+                signature = tuple(self._key(row[index]) for row in left)
+                if signature in tried:
+                    continue
+                tried.add(signature)
+                proposal = mapping + [index]
+                partial_left = [tuple(row[col] for col in proposal) for row in left]
+                partial_right = [tuple(row[col] for col in targets[:len(proposal)]) for row in right]
+                if self._rows_equal(partial_left, partial_right, order_sensitive) and align(proposal, used | {index}):
+                    return True
             return False
 
-        # Column name guard (set comparison — order-agnostic)
-        if set(norm_gen.columns) != set(norm_truth.columns):
-            return False
-
-        # Align column order to truth before cell-level comparison
-        try:
-            norm_gen = norm_gen[norm_truth.columns]
-        except KeyError:
-            return False
-
-        # Cell-level comparison (NaN == NaN treated as equal)
-        try:
-            return norm_gen.equals(norm_truth)
-        except Exception:
-            return False
+        return align([], set())
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +296,13 @@ class TaskResult:
     error_message: str = ""
     pipeline_success: bool = False
     tags: List[str] = field(default_factory=list)
+    first_sql: str = ""
+    first_error_type: str = ""
+    clarified_context: str = ""
+    needs_clarification: bool = False
+    classification_succeeded: bool = True
+    evaluation_error: bool = False
+    order_sensitive: bool = False
 
 
 @dataclass
@@ -221,6 +328,8 @@ class BenchmarkReport:
     self_correction_delta: float = 0.0  # pass@N - pass@1 (Δ EX gain from self-repair)
     avg_latency_ms: float = 0.0
     ambiguity_accuracy: float = 0.0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    evaluation_error_count: int = 0
 
     def finalize(self) -> "BenchmarkReport":
         """Compute aggregate accuracy metrics from task-level results. Returns self."""
@@ -232,9 +341,10 @@ class BenchmarkReport:
         self.semantic_repair_count = sum(1 for t in eligible if t.was_semantically_repaired)
         self.total_latency_ms = sum(t.latency_ms for t in self.task_results)
 
-        amb_tasks = [t for t in self.task_results if t.ambiguity_correct is not None]
+        amb_tasks = self.task_results
         self.ambiguity_tasks = len(amb_tasks)
         self.ambiguity_correct_count = sum(1 for t in amb_tasks if t.ambiguity_correct is True)
+        self.evaluation_error_count = sum(t.evaluation_error for t in self.task_results)
 
         n = self.ex_eligible_tasks
         self.pass_at_1_accuracy = (self.pass_at_1_count / n * 100) if n > 0 else 0.0
@@ -259,7 +369,10 @@ class BenchmarkReport:
                 "avg_latency_ms": round(self.avg_latency_ms, 2),
                 "semantic_repair_count": self.semantic_repair_count,
                 "ambiguity_classifier_accuracy_pct": round(self.ambiguity_accuracy, 2),
+                "evaluation_error_count": self.evaluation_error_count,
+                "run_status": "COMPLETED_WITH_ERRORS" if self.evaluation_error_count else "COMPLETED",
             },
+            "metadata": self.metadata,
             "tasks": [
                 {
                     "id": t.task_id,
@@ -279,6 +392,13 @@ class BenchmarkReport:
                     "pipeline_success": t.pipeline_success,
                     "error_message": t.error_message,
                     "tags": t.tags,
+                    "first_sql": t.first_sql,
+                    "first_error_type": t.first_error_type,
+                    "clarified_context": t.clarified_context,
+                    "needs_clarification": t.needs_clarification,
+                    "classification_succeeded": t.classification_succeeded,
+                    "evaluation_error": t.evaluation_error,
+                    "order_sensitive": t.order_sensitive,
                 }
                 for t in self.task_results
             ],
@@ -290,206 +410,135 @@ class BenchmarkReport:
 # ---------------------------------------------------------------------------
 
 class BenchmarkRunner:
-    """Orchestrates the full TPC-H benchmark evaluation over all tasks.
+    """Evaluate one observed pipeline trajectory per question, with UI defaults.
 
-    Workflow per task:
-    1. Execute ground truth SQL live to get the reference DataFrame.
-    2. Run ambiguity classifier and record classifier accuracy.
-    3. For EX-eligible tasks (non-HARD_AMBIGUITY):
-       a. Run pipeline with max_retries=1 → record Pass@1.
-       b. Run pipeline with full max_retries → record Pass@N.
-       c. Compare final generated DataFrame to ground truth DataFrame via EX comparator.
-    4. Accumulate into BenchmarkReport and finalize aggregate metrics.
+    Gold SQL is validated/executed before any LLM work. Gold outputs are visible
+    only to the evaluator after generation and never drive the repair loop.
     """
 
-    def __init__(
-        self,
-        db_conn=None,
-        retriever: Optional[SchemaMetricRetriever] = None,
-        max_retries: int = 3,
-        provider: Optional[str] = None,
-    ) -> None:
-        """Initialize the benchmark runner.
-
-        Args:
-            db_conn:     DuckDB connection. Defaults to shared global connection.
-            retriever:   SchemaMetricRetriever for RAG context. Optional.
-            max_retries: Max self-repair attempts for Pass@N evaluation.
-            provider:    LLM provider override ('gemini', 'openai', or None for auto).
-        """
+    def __init__(self, db_conn=None, retriever: Optional[SchemaMetricRetriever] = None,
+                 max_retries: int = 3, provider: Optional[str] = None,
+                 comparator: Optional[ExecutionAccuracyComparator] = None):
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 1:
+            raise ValueError("max_retries must be a positive integer.")
         self.db_conn = db_conn if db_conn is not None else get_connection()
         self.retriever = retriever
         self.max_retries = max_retries
         self.provider = provider
-        self.comparator = ExecutionAccuracyComparator()
+        self.comparator = comparator or ExecutionAccuracyComparator()
+        self._pipeline = SelfCorrectingPipeline(db_conn=self.db_conn, retriever=retriever)
 
-        # Shared pipeline instance (re-used across tasks)
-        self._pipeline = SelfCorrectingPipeline(
-            db_conn=self.db_conn,
-            retriever=self.retriever,
-        )
+    def _classify_ambiguity(self, question: str) -> AmbiguityResult:
+        return self._pipeline.check_ambiguity(user_question=question, provider=self.provider)
 
-    def _execute_ground_truth(self, sql: str) -> Optional[pd.DataFrame]:
-        """Execute the ground truth SQL and return its DataFrame, or None on error."""
-        df, err = execute_query(sql, conn=self.db_conn)
-        if err is not None:
-            return None
-        return df
+    def _prepare_tasks(self, tasks):
+        if not isinstance(tasks, list):
+            raise ValueError("Benchmark dataset must be a JSON list.")
+        known_ids, references = set(), {}
+        allowed_tables = set(get_schema_info(conn=self.db_conn))
+        for task in tasks:
+            if not isinstance(task, dict):
+                raise ValueError("Every benchmark task must be an object.")
+            task_id = task.get("id")
+            if not isinstance(task_id, str) or not task_id.strip() or task_id in known_ids:
+                raise ValueError("Benchmark IDs must be nonempty and unique.")
+            known_ids.add(task_id)
+            if not isinstance(task.get("question"), str) or not task["question"].strip():
+                raise ValueError(f"{task_id}: question must be nonempty.")
+            expected = task.get("expected_ambiguity", "CLEAR")
+            if expected not in ("CLEAR", "SOFT_DEFAULT", "HARD_AMBIGUITY"):
+                raise ValueError(f"{task_id}: invalid expected ambiguity.")
+            if not isinstance(task.get("order_sensitive", False), bool):
+                raise ValueError(f"{task_id}: order_sensitive must be boolean.")
+            if expected == "HARD_AMBIGUITY":
+                continue
+            gold = task.get("ground_truth_sql")
+            if not isinstance(gold, str) or not gold.strip():
+                raise ValueError(f"{task_id}: EX-eligible tasks require ground_truth_sql.")
+            valid, message = validate_sql(gold, allowed_tables=allowed_tables)
+            if not valid:
+                raise ValueError(f"{task_id}: unsafe/invalid ground truth SQL: {message}")
+            frame, error = execute_query(gold, conn=self.db_conn)
+            if error is not None or frame is None:
+                raise ValueError(f"{task_id}: Ground truth SQL execution failed: {error}")
+            references[task_id] = frame
+        return references
 
-    def _classify_ambiguity(self, question: str) -> Optional[str]:
-        """Run the ambiguity classifier and return the predicted ambiguity_type string."""
-        try:
-            result = self._pipeline.check_ambiguity(
-                user_question=question,
-                provider=self.provider,
-            )
-            return result.ambiguity_type
-        except Exception:
-            return None
-
-    def _run_single_attempt(
-        self,
-        question: str,
-        clarified_context: str = "",
-    ) -> PipelineResult:
-        """Run pipeline capped at exactly 1 attempt for Pass@1 measurement."""
-        return self._pipeline.execute_with_repair(
-            user_question=question,
-            max_retries=1,
-            provider=self.provider,
-            clarified_context=clarified_context,
-        )
-
-    def _run_full_repair(
-        self,
-        question: str,
-        clarified_context: str = "",
-    ) -> PipelineResult:
-        """Run pipeline with full self-repair for Pass@N measurement."""
-        return self._pipeline.execute_with_repair(
-            user_question=question,
-            max_retries=self.max_retries,
-            provider=self.provider,
-            clarified_context=clarified_context,
-        )
-
-    def run_benchmark(
-        self,
-        benchmark_file: str,
-        progress_callback=None,
-    ) -> BenchmarkReport:
-        """Run the full benchmark suite and return a finalized BenchmarkReport.
-
-        Args:
-            benchmark_file:    Path to the JSON benchmark dataset file.
-            progress_callback: Optional callable(current: int, total: int, task_id: str)
-                               called after each task completes (used by Streamlit progress bar).
-
-        Returns:
-            Finalized BenchmarkReport with per-task results and aggregate metrics.
-
-        Raises:
-            FileNotFoundError: If benchmark_file does not exist.
-            json.JSONDecodeError: If benchmark_file is malformed JSON.
-        """
+    def run_benchmark(self, benchmark_file: str, progress_callback=None) -> BenchmarkReport:
         benchmark_path = Path(benchmark_file)
-        if not benchmark_path.exists():
-            raise FileNotFoundError(f"Benchmark file not found: {benchmark_file}")
-
-        with open(benchmark_path, "r", encoding="utf-8") as f:
-            tasks = json.load(f)
-
-        report = BenchmarkReport(total_tasks=len(tasks))
-        total = len(tasks)
-
-        for idx, task in enumerate(tasks):
-            task_id = task.get("id", f"task_{idx}")
-            question = task.get("question", "")
-            category = task.get("category", "unknown")
-            expected_ambiguity = task.get("expected_ambiguity", "CLEAR")
-            ground_truth_sql = task.get("ground_truth_sql")
-            tags = task.get("tags", [])
-
-            task_result = TaskResult(
-                task_id=task_id,
-                category=category,
-                question=question,
-                expected_ambiguity=expected_ambiguity,
-                ground_truth_sql=ground_truth_sql or "",
-                tags=tags,
+        with benchmark_path.open(encoding="utf-8") as handle:
+            tasks = json.load(handle)
+        references = self._prepare_tasks(tasks)
+        provider = self.provider or settings.get_effective_provider()
+        report = BenchmarkReport(total_tasks=len(tasks), metadata={
+            "protocol": "single_trajectory_v1",
+            "pass_at_1": "first observed pipeline attempt passed validation and matched gold",
+            "pass_at_n": "final successful pipeline output matched gold within the attempt budget",
+            "gold_feedback_to_pipeline": False,
+            "max_attempts": self.max_retries,
+            "provider": provider,
+            "model": settings.gemini_model if provider == "gemini" else settings.openai_model if provider == "openai" else None,
+            "comparison": self.comparator.policy(),
+            "benchmark_sha256": hashlib.sha256(benchmark_path.read_bytes()).hexdigest(),
+            "started_at_utc": datetime.now(timezone.utc).isoformat(),
+            "retriever_enabled": self.retriever is not None,
+        })
+        for index, task in enumerate(tasks):
+            record = TaskResult(
+                task_id=task["id"], category=task.get("category", "unknown"),
+                question=task["question"], expected_ambiguity=task.get("expected_ambiguity", "CLEAR"),
+                ground_truth_sql=task.get("ground_truth_sql") or "", tags=task.get("tags", []),
+                ex_eligible=task["id"] in references,
+                order_sensitive=task.get("order_sensitive", False),
             )
-
-            task_start = time.perf_counter()
-
-            # ----------------------------------------------------------------
-            # Step 1: Ambiguity Classifier Accuracy (all tasks)
-            # ----------------------------------------------------------------
-            predicted_ambiguity = self._classify_ambiguity(question)
-            task_result.ambiguity_predicted = predicted_ambiguity
-            if predicted_ambiguity is not None:
-                task_result.ambiguity_correct = (
-                    predicted_ambiguity == expected_ambiguity
-                )
-
-            # ----------------------------------------------------------------
-            # Step 2: EX Evaluation (skip for HARD_AMBIGUITY tasks)
-            # ----------------------------------------------------------------
-            is_ex_eligible = (
-                expected_ambiguity != "HARD_AMBIGUITY"
-                and ground_truth_sql is not None
-                and ground_truth_sql.strip() != ""
-            )
-            task_result.ex_eligible = is_ex_eligible
-
-            if is_ex_eligible:
-                # Execute ground truth live
-                df_truth = self._execute_ground_truth(ground_truth_sql)
-
-                if df_truth is None:
-                    # Ground truth itself failed — skip EX for this task
-                    task_result.error_message = "Ground truth SQL execution failed."
-                    task_result.ex_eligible = False
-                else:
-                    # --- Pass@1 ---
-                    try:
-                        result_1 = self._run_single_attempt(question)
-                        if result_1.success and result_1.df is not None:
-                            task_result.pass_at_1 = self.comparator.compare_outputs(
-                                result_1.df, df_truth
-                            )
-                        else:
-                            task_result.pass_at_1 = False
-                    except Exception as e:
-                        task_result.pass_at_1 = False
-                        task_result.error_message += f" Pass@1 error: {e}"
-
-                    # --- Pass@N (full repair loop) ---
-                    try:
-                        result_n = self._run_full_repair(question)
-                        task_result.pipeline_success = result_n.success
-                        task_result.total_attempts = result_n.total_attempts
-                        task_result.was_semantically_repaired = result_n.was_semantically_repaired
-                        task_result.generated_sql = result_n.final_sql
-
-                        if result_n.success and result_n.df is not None:
-                            task_result.pass_at_n = self.comparator.compare_outputs(
-                                result_n.df, df_truth
-                            )
-                        else:
-                            task_result.pass_at_n = False
-                            if result_n.error_message:
-                                task_result.error_message += f" Pass@N error: {result_n.error_message}"
-                    except Exception as e:
-                        task_result.pass_at_n = False
-                        task_result.error_message += f" Pass@N exception: {e}"
-
-            task_result.latency_ms = (time.perf_counter() - task_start) * 1000
-            report.task_results.append(task_result)
-
+            if record.ex_eligible:
+                record.pass_at_1 = record.pass_at_n = False
+            started = time.perf_counter()
+            try:
+                ambiguity = self._classify_ambiguity(record.question)
+                record.ambiguity_predicted = ambiguity.ambiguity_type
+                record.classification_succeeded = ambiguity.classification_succeeded
+                record.ambiguity_correct = ambiguity.classification_succeeded and ambiguity.ambiguity_type == record.expected_ambiguity
+                if not ambiguity.classification_succeeded:
+                    record.evaluation_error = True
+                    record.error_message = ambiguity.reasoning
+                record.needs_clarification = ambiguity.is_ambiguous
+                if ambiguity.ambiguity_type == "SOFT_DEFAULT":
+                    record.clarified_context = ambiguity.default_interpretation
+                # A predicted HARD_AMBIGUITY pauses just as the assistant UI does.
+                # Expected-HARD tasks remain classifier-only even if misclassified.
+                if record.ex_eligible and not record.needs_clarification:
+                    result = self._pipeline.execute_with_repair(
+                        record.question, max_retries=self.max_retries,
+                        provider=self.provider, clarified_context=record.clarified_context,
+                    )
+                    record.pipeline_success = result.success
+                    record.total_attempts = result.total_attempts
+                    record.generated_sql = result.final_sql
+                    record.was_semantically_repaired = result.was_semantically_repaired
+                    if not result.attempts:
+                        raise ValueError("Pipeline returned no attempt telemetry; Pass@1 cannot be established.")
+                    first = result.attempts[0]
+                    record.first_sql, record.first_error_type = first.sql, first.error_type
+                    truth = references[record.task_id]
+                    record.pass_at_1 = first.success and first.df is not None and self.comparator.compare_outputs(
+                        first.df, truth, order_sensitive=record.order_sensitive,
+                    )
+                    record.pass_at_n = result.success and result.df is not None and self.comparator.compare_outputs(
+                        result.df, truth, order_sensitive=record.order_sensitive,
+                    )
+                    if result.error_message:
+                        record.error_message = "; ".join(filter(None, (record.error_message, result.error_message)))
+                    if any(attempt.error_type == "GENERATION_FAILURE" for attempt in result.attempts):
+                        record.evaluation_error = True
+            except Exception as exc:
+                record.evaluation_error = True
+                if record.ambiguity_correct is None:
+                    record.ambiguity_correct = False
+                    record.classification_succeeded = False
+                record.error_message = "; ".join(filter(None, (record.error_message, str(exc))))
+            record.latency_ms = (time.perf_counter() - started) * 1000
+            report.task_results.append(record)
             if progress_callback is not None:
-                try:
-                    progress_callback(idx + 1, total, task_id)
-                except Exception:
-                    pass
-
+                progress_callback(index + 1, len(tasks), record.task_id)
         return report.finalize()

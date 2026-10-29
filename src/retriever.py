@@ -2,27 +2,40 @@
 
 from __future__ import annotations
 
-import os
+import hashlib
+import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import yaml
 import chromadb
 from chromadb.config import Settings
+from src.config import settings as app_settings
 
 
 class SchemaMetricRetriever:
-    """In-memory semantic retriever for business metrics, rules, and schema metadata."""
+    """Persistent semantic retriever with content-hash-based incremental indexing."""
 
-    def __init__(self, client: Optional[chromadb.ClientAPI] = None):
-        """Initialize ChromaDB ephemeral client and collections.
+    def __init__(
+        self,
+        client: Optional[chromadb.ClientAPI] = None,
+        storage_path: Optional[str | Path] = None,
+    ):
+        """Initialize persistent collections, or use a caller-supplied test/client.
 
         Args:
             client: Optional pre-configured ChromaDB ClientAPI instance.
+            storage_path: Persistent directory, defaulting to CHROMA_STORAGE_PATH.
         """
         if client is not None:
             self.client = client
         else:
-            self.client = chromadb.EphemeralClient(
+            target_path = Path(
+                storage_path if storage_path is not None else app_settings.chroma_storage_path
+            ).expanduser()
+            if not target_path.is_absolute():
+                target_path = app_settings.base_dir / target_path
+            self.client = chromadb.PersistentClient(
+                path=str(target_path.resolve()),
                 settings=Settings(anonymized_telemetry=False)
             )
 
@@ -35,6 +48,53 @@ class SchemaMetricRetriever:
         self.schema_collection = self.client.get_or_create_collection(
             name="schema_catalog"
         )
+
+    @staticmethod
+    def _sync_collection(
+        collection,
+        ids: List[str],
+        documents: List[str],
+        metadatas: List[Dict[str, Any]],
+    ) -> None:
+        """Embed changed entries only, prune removals, and persist a corpus hash.
+
+        Mark the corpus current only after successful synchronization, so interrupted
+        updates are retried on the next startup. Hashes include the index format version.
+        """
+        if len(set(ids)) != len(ids):
+            raise ValueError(f"Duplicate catalog IDs in {collection.name}.")
+        entries = []
+        for item_id, document, metadata in zip(ids, documents, metadatas):
+            payload = json.dumps(
+                [1, document, metadata], sort_keys=True, ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            content_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            entries.append((item_id, document, {**metadata, "content_hash": content_hash}))
+        corpus_hash = hashlib.sha256(json.dumps(
+            sorted((item_id, metadata["content_hash"]) for item_id, _, metadata in entries),
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+
+        stored = collection.get(include=["metadatas"])
+        previous = dict(zip(stored["ids"], stored["metadatas"]))
+        changed = [
+            entry for entry in entries
+            if (previous.get(entry[0]) or {}).get("content_hash") != entry[2]["content_hash"]
+        ]
+        for offset in range(0, len(changed), 100):
+            batch = changed[offset:offset + 100]
+            collection.upsert(
+                ids=[entry[0] for entry in batch],
+                documents=[entry[1] for entry in batch],
+                metadatas=[entry[2] for entry in batch],
+            )
+        stale_ids = sorted(set(previous) - set(ids))
+        for offset in range(0, len(stale_ids), 100):
+            collection.delete(ids=stale_ids[offset:offset + 100])
+        metadata = collection.metadata or {}
+        if metadata.get("catalog_hash") != corpus_hash:
+            collection.modify(metadata={**metadata, "catalog_hash": corpus_hash})
 
     def index_catalog(
         self,
@@ -95,12 +155,7 @@ class SchemaMetricRetriever:
                 "description": desc,
             })
 
-        if m_ids:
-            self.metrics_collection.upsert(
-                ids=m_ids,
-                documents=m_docs,
-                metadatas=m_metadatas,
-            )
+        self._sync_collection(self.metrics_collection, m_ids, m_docs, m_metadatas)
 
         # 2. Index Filters (Business Predicates)
         f_ids: List[str] = []
@@ -140,12 +195,7 @@ class SchemaMetricRetriever:
                 "description": desc,
             })
 
-        if f_ids:
-            self.filters_collection.upsert(
-                ids=f_ids,
-                documents=f_docs,
-                metadatas=f_metadatas,
-            )
+        self._sync_collection(self.filters_collection, f_ids, f_docs, f_metadatas)
 
         # 3. Index Schema Tables & Columns
         s_ids: List[str] = []
@@ -172,12 +222,7 @@ class SchemaMetricRetriever:
                     s_docs.append(line_str)
                     s_metadatas.append({"table": tbl_name, "col_count": 0})
 
-        if s_ids:
-            self.schema_collection.upsert(
-                ids=s_ids,
-                documents=s_docs,
-                metadatas=s_metadatas,
-            )
+        self._sync_collection(self.schema_collection, s_ids, s_docs, s_metadatas)
 
         return {
             "metrics_indexed": len(m_ids),

@@ -15,12 +15,15 @@ from __future__ import annotations
 import json
 import math
 import tempfile
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import duckdb
 import pandas as pd
 import pytest
+
+from src.ambiguity import AmbiguityResult
 
 from src.evaluator import (
     BenchmarkReport,
@@ -118,8 +121,8 @@ class TestExecutionAccuracyComparator:
         df2 = self._df({"n": [1, 2, 3]})
         assert self.cmp.compare_outputs(df1, df2) is True
 
-    def test_float_rounding_tolerance(self):
-        """Values that round to the same 2dp → match."""
+    def test_close_float_values_match_within_tolerance(self):
+        """EX compares numeric distance without rounding the input values."""
         # 100.0049 → 100.0 and 100.0050 → 100.01 (banker's rounding on some systems)
         # Use values that definitively round to the same 2dp value
         df1 = self._df({"val": [100.001]})
@@ -132,10 +135,11 @@ class TestExecutionAccuracyComparator:
         df2 = self._df({"a": [1, 2]})
         assert self.cmp.compare_outputs(df1, df2) is False
 
-    def test_column_name_mismatch_returns_false(self):
+    def test_column_alias_mismatch_is_ignored_by_default(self):
         df1 = self._df({"revenue": [100.0]})
         df2 = self._df({"gross": [100.0]})
-        assert self.cmp.compare_outputs(df1, df2) is False
+        assert self.cmp.compare_outputs(df1, df2) is True
+        assert ExecutionAccuracyComparator(ignore_column_names=False).compare_outputs(df1, df2) is False
 
     def test_value_mismatch_returns_false(self):
         df1 = self._df({"revenue": [100.0]})
@@ -154,11 +158,61 @@ class TestExecutionAccuracyComparator:
         df2 = self._df({"val": [float("nan")]})
         assert self.cmp.compare_outputs(df1, df2) is True
 
-    def test_string_case_agnostic(self):
-        """After normalisation, 'GERMANY' and 'germany' should match."""
+    def test_string_case_is_preserved_unless_explicitly_disabled(self):
+        """Default EX preserves case; an explicit policy can ignore case."""
         df1 = self._df({"nation": ["GERMANY"]})
         df2 = self._df({"nation": ["germany"]})
-        assert self.cmp.compare_outputs(df1, df2) is True
+        assert self.cmp.compare_outputs(df1, df2) is False
+        assert ExecutionAccuracyComparator(case_sensitive_strings=False).compare_outputs(df1, df2) is True
+
+    @pytest.mark.parametrize("left,right,expected", [
+        (1.0049, 1.0051, True),
+        (1.0, 1.01, True),
+        (1.0, 1.01001, False),
+        (1_000_000_000.0, 1_000_000_001.0, False),
+        (Decimal("9007199254740992"), Decimal("9007199254740993"), False),
+        (Decimal("12.30"), 12.3, True),
+        (1, 1.0, True),
+        (True, 1, False),
+        ("1", 1, False),
+        (float("inf"), float("inf"), True),
+        (float("inf"), float("-inf"), False),
+    ])
+    def test_explicit_numeric_tolerance_and_type_policy(self, left, right, expected):
+        assert self.cmp.compare_outputs(pd.DataFrame({"a": [left]}), pd.DataFrame({"b": [right]})) is expected
+
+    def test_duplicate_rows_are_not_collapsed(self):
+        assert not self.cmp.compare_outputs(pd.DataFrame({"a": [1, 1, 2]}), pd.DataFrame({"b": [1, 2, 2]}))
+
+    def test_identical_column_marginals_do_not_hide_different_row_correlations(self):
+        left = pd.DataFrame({"a": [0, 0, 1], "b": [0, 1, 1]})
+        right = pd.DataFrame({"x": [0, 0, 1], "y": [1, 1, 0]})
+        assert not self.cmp.compare_outputs(left, right)
+
+    def test_column_mapping_is_global_and_backtracks_ambiguous_marginals(self):
+        left = pd.DataFrame({"x": [1, 2, 0], "y": [0, 1, 2]})
+        right = pd.DataFrame({"a": [0, 1, 2], "b": [1, 2, 0]})
+        assert self.cmp.compare_outputs(left, right)
+
+    def test_tolerance_matching_does_not_greedily_consume_an_exact_match(self):
+        left = pd.DataFrame({"a": [0.0, 0.009]})
+        right = pd.DataFrame({"b": [0.009, 0.018]})
+        assert self.cmp.compare_outputs(left, right)
+
+    def test_order_sensitive_policy_is_opt_in(self):
+        left, right = pd.DataFrame({"a": [1, 2]}), pd.DataFrame({"b": [2, 1]})
+        assert self.cmp.compare_outputs(left, right)
+        assert not self.cmp.compare_outputs(left, right, order_sensitive=True)
+
+    def test_nullable_numeric_dtypes_compare_without_string_coercion(self):
+        left = pd.DataFrame({"a": pd.array([1, None, 2], dtype="Int64")})
+        right = pd.DataFrame({"b": [2.0, float("nan"), 1.0]})
+        assert self.cmp.compare_outputs(left, right)
+
+    @pytest.mark.parametrize("tolerance", [-1, float("nan"), float("inf")])
+    def test_invalid_tolerances_raise(self, tolerance):
+        with pytest.raises(ValueError):
+            ExecutionAccuracyComparator(atol=tolerance)
 
 
 # ─── BenchmarkReport ─────────────────────────────────────────────────────────
@@ -258,6 +312,12 @@ class TestBenchmarkReport:
         assert report.pass_at_n_accuracy == 0.0
         assert report.avg_latency_ms == 0.0
 
+    def test_missing_classifier_predictions_stay_in_denominator(self):
+        report = BenchmarkReport(total_tasks=2, task_results=[self._make_task(), self._make_task(amb_correct=None)])
+        report.finalize()
+        assert report.ambiguity_tasks == 2
+        assert report.ambiguity_accuracy == 50.0
+
 
 # ─── BenchmarkRunner (integration with in-memory DuckDB) ─────────────────────
 
@@ -318,7 +378,7 @@ class TestBenchmarkRunner:
         path = self._make_benchmark_file(tasks)
         runner = self._make_runner(generator_fn=gen)
 
-        with patch.object(runner, "_classify_ambiguity", return_value="CLEAR"):
+        with patch.object(runner, "_classify_ambiguity", return_value=AmbiguityResult(False, "CLEAR")):
             report = runner.run_benchmark(path)
 
         assert report.ex_eligible_tasks == 1
@@ -338,7 +398,7 @@ class TestBenchmarkRunner:
         path = self._make_benchmark_file(tasks)
         runner = self._make_runner()
 
-        with patch.object(runner, "_classify_ambiguity", return_value="HARD_AMBIGUITY"):
+        with patch.object(runner, "_classify_ambiguity", return_value=AmbiguityResult(True, "HARD_AMBIGUITY")):
             report = runner.run_benchmark(path)
 
         assert report.ex_eligible_tasks == 0
@@ -364,46 +424,33 @@ class TestBenchmarkRunner:
         path = self._make_benchmark_file(tasks)
         runner = self._make_runner(generator_fn=gen)
 
-        with patch.object(runner, "_classify_ambiguity", return_value="CLEAR"):
+        with patch.object(runner, "_classify_ambiguity", return_value=AmbiguityResult(False, "CLEAR")):
             report = runner.run_benchmark(path)
 
         assert report.pass_at_n_count == 0
         assert report.pass_at_n_accuracy == 0.0
 
     def test_pass_at_1_vs_pass_at_n_distinction(self):
-        """Pass@1=False when 1-attempt result mismatches GT; Pass@N=True when full repair matches."""
+        """One generator call, one repair, and both scores observe that trajectory."""
         tasks = [{
-            "id": "t03",
-            "category": "repair",
-            "question": "How many nations total?",
-            "ground_truth_sql": "SELECT COUNT(*) AS nation_count FROM nation;",
+            "id": "repair", "category": "repair", "question": "How many nations total?",
+            "ground_truth_sql": "SELECT COUNT(*) AS nation_count FROM nation",
             "expected_ambiguity": "CLEAR",
-            "tags": [],
         }]
-        path = self._make_benchmark_file(tasks)
-        runner = self._make_runner()
-
-        # Pass@1: generator returns count=1 (wrong — GT returns 3)
-        wrong_df = pd.DataFrame({"nation_count": [1]})
-        # Pass@N: repaired pipeline returns count=3 (correct)
-        correct_df = pd.DataFrame({"nation_count": [3]})
-
-        from src.pipeline import PipelineResult
-        pass1_result = PipelineResult(success=True, final_sql="SELECT ...",
-                                      df=wrong_df, total_attempts=1)
-        passn_result = PipelineResult(success=True, final_sql="SELECT COUNT(*) AS nation_count FROM nation;",
-                                      df=correct_df, total_attempts=2,
-                                      was_semantically_repaired=False)
-
-        with patch.object(runner, "_classify_ambiguity", return_value="CLEAR"), \
-             patch.object(runner, "_run_single_attempt", return_value=pass1_result), \
-             patch.object(runner, "_run_full_repair", return_value=passn_result):
-            report = runner.run_benchmark(path)
-
-        t = report.task_results[0]
-        assert t.pass_at_1 is False, "Expected Pass@1 to be False (wrong count)"
-        assert t.pass_at_n is True,  "Expected Pass@N to be True (correct count after repair)"
+        generator = MagicMock(return_value="SELECT missing_column FROM nation")
+        repair = MagicMock(return_value="SELECT COUNT(*) AS count_alias FROM nation")
+        runner = self._make_runner(generator_fn=generator, repair_fn=repair)
+        with patch.object(runner, "_classify_ambiguity", return_value=AmbiguityResult(False, "CLEAR")):
+            report = runner.run_benchmark(self._make_benchmark_file(tasks))
+        result = report.task_results[0]
+        assert result.pass_at_1 is False and result.pass_at_n is True
+        assert result.first_sql == "SELECT missing_column FROM nation"
+        assert result.first_error_type == "DUCKDB_RUNTIME"
+        assert result.total_attempts == 2
         assert report.self_correction_delta == 100.0
+        generator.assert_called_once()
+        repair.assert_called_once()
+        assert "ground_truth_sql" not in repair.call_args.kwargs
 
     def test_missing_benchmark_file_raises(self):
         runner = self._make_runner()
@@ -433,27 +480,107 @@ class TestBenchmarkRunner:
             generator_fn=lambda q, schema, **kw: "SELECT COUNT(*) AS n FROM nation;"
         )
 
-        with patch.object(runner, "_classify_ambiguity", return_value="CLEAR"):
+        with patch.object(runner, "_classify_ambiguity", return_value=AmbiguityResult(False, "CLEAR")):
             runner.run_benchmark(path, progress_callback=cb)
 
         assert len(calls) == 3
         assert calls[-1][0] == 3  # last call current == total
 
-    def test_ground_truth_failure_marks_task_ineligible(self):
-        """If ground truth SQL itself fails, task should be marked ineligible."""
+    def test_ground_truth_failure_aborts_before_llm_work(self):
         tasks = [{
-            "id": "t_bad_gt",
-            "category": "simple",
-            "question": "Broken ground truth",
-            "ground_truth_sql": "SELECT nonexistent_col FROM nation;",
+            "id": "bad_gold", "question": "Broken ground truth",
+            "ground_truth_sql": "SELECT nonexistent_col FROM nation",
             "expected_ambiguity": "CLEAR",
-            "tags": [],
         }]
-        path = self._make_benchmark_file(tasks)
         runner = self._make_runner()
+        with patch.object(runner, "_classify_ambiguity") as classify, pytest.raises(ValueError, match="Ground truth SQL execution failed"):
+            runner.run_benchmark(self._make_benchmark_file(tasks))
+        classify.assert_not_called()
 
-        with patch.object(runner, "_classify_ambiguity", return_value="CLEAR"):
-            report = runner.run_benchmark(path)
+    def test_first_attempt_success_does_not_regenerate_or_repair(self):
+        tasks = [{"id": "once", "question": "How many nations?", "ground_truth_sql": "SELECT COUNT(*) FROM nation"}]
+        generator = MagicMock(side_effect=["SELECT COUNT(*) AS total FROM nation", "SELECT 99"])
+        repair = MagicMock(side_effect=AssertionError("No repair expected"))
+        runner = self._make_runner(generator_fn=generator, repair_fn=repair)
+        with patch.object(runner, "_classify_ambiguity", return_value=AmbiguityResult(False, "CLEAR")):
+            report = runner.run_benchmark(self._make_benchmark_file(tasks))
+        assert report.pass_at_1_accuracy == report.pass_at_n_accuracy == 100.0
+        generator.assert_called_once()
+        repair.assert_not_called()
 
-        assert report.task_results[0].ex_eligible is False
-        assert "Ground truth SQL execution failed" in report.task_results[0].error_message
+    def test_soft_default_flows_from_grounded_classifier_through_repairs(self):
+        tasks = [{"id": "defaults", "question": "Show nations", "expected_ambiguity": "SOFT_DEFAULT", "ground_truth_sql": "SELECT n_name FROM nation ORDER BY n_name LIMIT 2"}]
+        runner = self._make_runner()
+        from src.ambiguity import AmbiguityClassifier
+        from src.pipeline import SelfCorrectingPipeline
+        retriever = MagicMock()
+        retriever.retrieve.return_value = ("DOMAIN DEFAULT: nation names", [])
+        prompts, contexts = [], []
+
+        def classifier(prompt):
+            prompts.append(prompt)
+            return json.dumps({"ambiguity_type": "SOFT_DEFAULT", "default_interpretation": "Alphabetical, LIMIT 2"})
+
+        def generate(*args, **kwargs):
+            contexts.append(kwargs["clarified_context"])
+            return "SELECT typo FROM nation"
+
+        def repair(**kwargs):
+            contexts.append(kwargs["clarified_context"])
+            return "SELECT n_name FROM nation ORDER BY n_name LIMIT 2"
+
+        runner._pipeline = SelfCorrectingPipeline(db_conn=self.conn, retriever=retriever,
+            classifier=AmbiguityClassifier(classifier_fn=classifier), generator_fn=generate, repair_fn=repair)
+        report = runner.run_benchmark(self._make_benchmark_file(tasks))
+        assert "DOMAIN DEFAULT" in prompts[0]
+        assert contexts == ["Alphabetical, LIMIT 2"] * 2
+        assert report.pass_at_n_accuracy == 100.0
+        assert report.task_results[0].clarified_context == "Alphabetical, LIMIT 2"
+
+    def test_false_positive_hard_ambiguity_counts_as_ex_failure_without_execution(self):
+        tasks = [{"id": "abstain", "question": "How many nations?", "ground_truth_sql": "SELECT COUNT(*) FROM nation"}]
+        runner = self._make_runner()
+        with patch.object(runner, "_classify_ambiguity", return_value=AmbiguityResult(True, "HARD_AMBIGUITY")), patch.object(runner._pipeline, "execute_with_repair") as execute:
+            report = runner.run_benchmark(self._make_benchmark_file(tasks))
+        assert report.ex_eligible_tasks == 1 and report.pass_at_n_accuracy == 0
+        assert report.task_results[0].needs_clarification
+        execute.assert_not_called()
+
+    def test_classifier_exceptions_are_reported_and_counted(self):
+        tasks = [{"id": "error", "question": "How many nations?", "ground_truth_sql": "SELECT COUNT(*) FROM nation"}]
+        runner = self._make_runner()
+        with patch.object(runner, "_classify_ambiguity", side_effect=RuntimeError("provider down")):
+            report = runner.run_benchmark(self._make_benchmark_file(tasks))
+        assert report.ambiguity_tasks == 1 and report.ambiguity_accuracy == 0
+        assert report.evaluation_error_count == 1
+        assert report.to_dict()["summary"]["run_status"] == "COMPLETED_WITH_ERRORS"
+
+    @pytest.mark.parametrize("gold", ["DROP TABLE nation", "SELECT * FROM read_csv('/etc/passwd')", "SELECT 1; DELETE FROM nation"])
+    def test_unsafe_gold_aborts_without_running_a_classifier(self, gold):
+        runner = self._make_runner()
+        tasks = [{"id": "bad", "question": "Bad gold", "ground_truth_sql": gold}]
+        with patch.object(runner, "_classify_ambiguity") as classify, pytest.raises(ValueError, match="unsafe/invalid"):
+            runner.run_benchmark(self._make_benchmark_file(tasks))
+        classify.assert_not_called()
+        assert self.conn.execute("SELECT COUNT(*) FROM nation").fetchone()[0] == 3
+
+    @pytest.mark.parametrize("tasks", [
+        {}, [{"id": "empty", "question": ""}],
+        [{"id": "missing", "question": "Missing gold"}],
+        [{"id": "type", "question": "Q", "expected_ambiguity": "UNKNOWN"}],
+        [{"id": "duplicate", "question": "Q", "expected_ambiguity": "HARD_AMBIGUITY"}] * 2,
+    ])
+    def test_invalid_dataset_is_rejected(self, tasks):
+        with pytest.raises(ValueError):
+            self._make_runner().run_benchmark(self._make_benchmark_file(tasks))
+
+    def test_export_identifies_protocol_and_comparison_policy(self):
+        tasks = [{"id": "audit", "question": "How many nations?", "ground_truth_sql": "SELECT COUNT(*) FROM nation"}]
+        runner = self._make_runner(generator_fn=lambda *a, **kw: "SELECT COUNT(*) FROM nation")
+        with patch.object(runner, "_classify_ambiguity", return_value=AmbiguityResult(False, "CLEAR")):
+            data = runner.run_benchmark(self._make_benchmark_file(tasks)).to_dict()
+        assert data["metadata"]["protocol"] == "single_trajectory_v1"
+        assert data["metadata"]["gold_feedback_to_pipeline"] is False
+        assert data["metadata"]["comparison"]["absolute_tolerance"] == "0.01"
+        assert len(data["metadata"]["benchmark_sha256"]) == 64
+        assert data["tasks"][0]["first_sql"] == "SELECT COUNT(*) FROM nation"

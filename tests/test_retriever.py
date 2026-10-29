@@ -1,7 +1,16 @@
 """Tests for ChromaDB Schema & Metric Vector Retriever."""
 
-import pytest
+import json
+import os
+import subprocess
+import sys
+from dataclasses import replace
+from pathlib import Path
+
 import chromadb
+import pytest
+import yaml
+from chromadb.api.models.Collection import Collection
 from chromadb.config import Settings
 from src.retriever import SchemaMetricRetriever
 
@@ -90,3 +99,158 @@ def test_retrieve_irrelevant_threshold(retriever):
     )
     assert metadata == []
     assert context == ""
+
+
+@pytest.fixture
+def persistent_catalog(tmp_path):
+    catalog = yaml.safe_load(Path(METRICS_PATH).read_text())
+    path = tmp_path / "metrics.yaml"
+    path.write_text(yaml.safe_dump(catalog))
+    storage = tmp_path / "chroma"
+    ret = SchemaMetricRetriever(storage_path=storage)
+    ret.index_catalog(str(path), SAMPLE_SCHEMA)
+    return ret, catalog, path, storage
+
+
+def test_persistent_cache_reuses_unchanged_entries(persistent_catalog, monkeypatch):
+    _, _, path, storage = persistent_catalog
+    monkeypatch.setattr(Collection, "upsert", lambda *a, **kw: pytest.fail("unchanged entries re-embedded"))
+    monkeypatch.setattr(Collection, "modify", lambda *a, **kw: pytest.fail("unchanged metadata rewritten"))
+    reloaded = SchemaMetricRetriever(storage_path=storage)
+    assert reloaded.index_catalog(str(path), SAMPLE_SCHEMA) == {
+        "metrics_indexed": 5, "filters_indexed": 2, "tables_indexed": 4,
+    }
+    assert reloaded.metrics_collection.metadata["catalog_hash"]
+
+
+def test_persistent_cache_survives_a_new_python_process(persistent_catalog):
+    _, _, path, storage = persistent_catalog
+    script = """
+import sys
+import json
+from chromadb.api.models.Collection import Collection
+from src.retriever import SchemaMetricRetriever
+def no_embedding(*args, **kwargs):
+    raise AssertionError('unchanged persistent entry was re-embedded')
+Collection.upsert = no_embedding
+retriever = SchemaMetricRetriever(storage_path=sys.argv[1])
+schema = json.loads(sys.argv[3])
+counts = retriever.index_catalog(sys.argv[2], schema)
+assert counts == {'metrics_indexed': 5, 'filters_indexed': 2, 'tables_indexed': 4}
+assert retriever.metrics_collection.get(ids=['metric_net_revenue'])['documents']
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(storage), str(path), json.dumps(SAMPLE_SCHEMA)],
+        cwd=Path(__file__).resolve().parent.parent,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        text=True, capture_output=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_catalog_change_only_reembeds_changed_metric(persistent_catalog, monkeypatch):
+    ret, catalog, path, _ = persistent_catalog
+    original_hash = ret.metrics_collection.metadata["catalog_hash"]
+    catalog["metrics"][0]["formula"] = "SUM(l_extendedprice * 0.9)"
+    path.write_text(yaml.safe_dump(catalog))
+    upserts = []
+    original_upsert = Collection.upsert
+
+    def record_upsert(collection, **kwargs):
+        upserts.append((collection.name, kwargs["ids"]))
+        return original_upsert(collection, **kwargs)
+
+    monkeypatch.setattr(Collection, "upsert", record_upsert)
+    ret.index_catalog(str(path), SAMPLE_SCHEMA)
+    assert upserts == [("metrics_catalog", ["metric_net_revenue"])]
+    assert ret.metrics_collection.metadata["catalog_hash"] != original_hash
+    assert ret.metrics_collection.get(ids=["metric_net_revenue"])["metadatas"][0]["formula"] == "SUM(l_extendedprice * 0.9)"
+
+
+def test_schema_change_only_reembeds_changed_table(persistent_catalog, monkeypatch):
+    ret, _, path, _ = persistent_catalog
+    schema = {**SAMPLE_SCHEMA, "customer": [*SAMPLE_SCHEMA["customer"], {"name": "tier", "type": "VARCHAR"}]}
+    upserts = []
+    original_upsert = Collection.upsert
+
+    def record_upsert(collection, **kwargs):
+        upserts.append((collection.name, kwargs["ids"]))
+        return original_upsert(collection, **kwargs)
+
+    monkeypatch.setattr(Collection, "upsert", record_upsert)
+    ret.index_catalog(str(path), schema)
+    assert upserts == [("schema_catalog", ["table_customer"])]
+
+
+def test_catalog_removals_prune_all_collections(persistent_catalog, monkeypatch):
+    ret, catalog, path, _ = persistent_catalog
+    catalog["metrics"].pop(0)
+    catalog["filters"].pop(0)
+    path.write_text(yaml.safe_dump(catalog))
+    schema = {key: value for key, value in SAMPLE_SCHEMA.items() if key != "orders"}
+    monkeypatch.setattr(Collection, "upsert", lambda *a, **kw: pytest.fail("unchanged entry re-embedded"))
+    ret.index_catalog(str(path), schema)
+    assert ret.metrics_collection.count() == 4
+    assert ret.filters_collection.count() == 1
+    assert ret.schema_collection.count() == 3
+    assert ret.metrics_collection.get(ids=["metric_net_revenue"])["ids"] == []
+    assert ret.filters_collection.get(ids=["filter_urgent_orders"])["ids"] == []
+    assert ret.schema_collection.get(ids=["table_orders"])["ids"] == []
+
+
+def test_empty_catalog_clears_persisted_entries(persistent_catalog):
+    ret, _, path, _ = persistent_catalog
+    path.write_text("metrics: []\nfilters: []\n")
+    ret.index_catalog(str(path), {})
+    assert ret.retrieve("What is the net revenue?") == ("", [])
+    assert all(collection.count() == 0 for collection in (
+        ret.metrics_collection, ret.filters_collection, ret.schema_collection,
+    ))
+
+
+def test_catalog_reordering_does_not_reembed(persistent_catalog, monkeypatch):
+    ret, catalog, path, _ = persistent_catalog
+    catalog["metrics"].reverse()
+    catalog["filters"].reverse()
+    path.write_text(yaml.safe_dump(catalog))
+    monkeypatch.setattr(Collection, "upsert", lambda *a, **kw: pytest.fail("reordering re-embedded entries"))
+    monkeypatch.setattr(Collection, "modify", lambda *a, **kw: pytest.fail("reordering changed hash"))
+    ret.index_catalog(str(path), dict(reversed(list(SAMPLE_SCHEMA.items()))))
+
+
+def test_failed_index_update_is_retried(persistent_catalog, monkeypatch):
+    ret, catalog, path, _ = persistent_catalog
+    original_hash = ret.metrics_collection.metadata["catalog_hash"]
+    catalog["metrics"][0]["description"] = "Updated business definition"
+    path.write_text(yaml.safe_dump(catalog))
+    with monkeypatch.context() as patcher:
+        def fail_update(*args, **kwargs):
+            raise RuntimeError("interrupted indexing")
+        patcher.setattr(Collection, "upsert", fail_update)
+        with pytest.raises(RuntimeError, match="interrupted indexing"):
+            ret.index_catalog(str(path), SAMPLE_SCHEMA)
+    assert ret.metrics_collection.metadata["catalog_hash"] == original_hash
+    ret.index_catalog(str(path), SAMPLE_SCHEMA)
+    assert ret.metrics_collection.metadata["catalog_hash"] != original_hash
+
+
+def test_missing_persisted_entry_is_restored(persistent_catalog):
+    ret, _, path, _ = persistent_catalog
+    ret.metrics_collection.delete(ids=["metric_tax_amount"])
+    ret.index_catalog(str(path), SAMPLE_SCHEMA)
+    assert ret.metrics_collection.count() == 5
+    assert ret.metrics_collection.get(ids=["metric_tax_amount"])["ids"] == ["metric_tax_amount"]
+
+
+def test_default_storage_is_relative_to_project_root(tmp_path, monkeypatch):
+    from src import retriever as retriever_module
+
+    monkeypatch.setattr(retriever_module, "app_settings", replace(
+        retriever_module.app_settings, base_dir=tmp_path, chroma_storage_path=Path("vector_cache"),
+    ))
+    launch_directory = tmp_path / "another_directory"
+    launch_directory.mkdir()
+    monkeypatch.chdir(launch_directory)
+    SchemaMetricRetriever()
+    assert (tmp_path / "vector_cache").is_dir()
+    assert not (launch_directory / "vector_cache").exists()
