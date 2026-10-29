@@ -1,0 +1,13 @@
+{
+  "recorded_at_utc": "2026-10-29T15:49:51.195917+00:00",
+  "model": "gemini-3.6-flash",
+  "timeout_seconds": 60.0,
+  "max_attempts": 1,
+  "thinking_level": "low",
+  "endpoint": "generateContent",
+  "business_data_sent": false,
+  "status": "FAILED",
+  "code": 503,
+  "error": "Gemini model 'gemini-3.6-flash' failed after 1 request(s) (HTTP 503): 503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}. Check the Gemini service status and network, then retry.",
+  "elapsed_seconds": 2.65
+}

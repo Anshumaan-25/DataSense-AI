@@ -1,0 +1,19 @@
+{
+  "model": "gemini-3.6-flash",
+  "endpoint": "generateContent",
+  "status": "success",
+  "elapsed_s": 6.75,
+  "text": "OK",
+  "usage": {
+    "candidates_token_count": 1,
+    "prompt_token_count": 7,
+    "prompt_tokens_details": [
+      {
+        "modality": "TEXT",
+        "token_count": 7
+      }
+    ],
+    "thoughts_token_count": 91,
+    "total_token_count": 99
+  }
+}

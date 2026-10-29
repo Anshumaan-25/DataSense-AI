@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from src.config import settings
+from src.llm import ProviderRequestError, generate_gemini_text
+from src.groq_client import generate_groq_text
 
 
 @dataclass
@@ -26,6 +28,9 @@ class AmbiguityResult:
     options: List[Dict[str, str]] = field(default_factory=list)
     default_interpretation: str = ""
     classification_succeeded: bool = True
+    provider_failed: bool = False
+    provider_error_code: Optional[int] = None
+    quota_kind: Optional[str] = None
 
 
 AMBIGUITY_SYSTEM_PROMPT = """You are a Senior Data Analyst and Intent Clarification Agent for a DuckDB analytics platform.
@@ -170,7 +175,7 @@ class AmbiguityClassifier:
             user_question: Natural language query submitted by user.
             schema_info: Database DDL or table schema summary.
             rag_context: Business metric and filter rules retrieved via RAG.
-            provider: LLM provider override ('gemini', 'openai').
+            provider: LLM provider override ('groq', 'gemini', 'openai').
 
         Returns:
             AmbiguityResult with 3-tier classification, reasoning, and structured options.
@@ -206,6 +211,9 @@ class AmbiguityClassifier:
                     ambiguity_type="CLEAR",
                     reasoning=f"Custom classifier fallback on exception: {exc}",
                     classification_succeeded=False,
+                    provider_failed=isinstance(exc, ProviderRequestError),
+                    provider_error_code=getattr(exc, "code", None),
+                    quota_kind=getattr(exc, "quota_kind", None),
                 )
 
         # Call configured LLM provider
@@ -220,34 +228,18 @@ class AmbiguityClassifier:
                         reasoning="Gemini API key not configured, bypassing classifier.",
                         classification_succeeded=False,
                     )
-                from google import genai
-                from google.genai import types
-
-                client = genai.Client(api_key=settings.gemini_api_key)
-                import time
-                last_err = None
-                raw_response = ""
-                for attempt in range(3):
-                    try:
-                        response = client.models.generate_content(
-                            model=settings.gemini_model,
-                            contents=[AMBIGUITY_SYSTEM_PROMPT, user_prompt],
-                            config=types.GenerateContentConfig(
-                                response_mime_type="application/json",
-                                temperature=0.0,
-                            ),
-                        )
-                        raw_response = response.text or ""
-                        last_err = None
-                        break
-                    except Exception as e:
-                        last_err = e
-                        if ("503" in str(e) or "429" in str(e) or "UNAVAILABLE" in str(e)) and attempt < 2:
-                            time.sleep(1.5 * (attempt + 1))
-                            continue
-                        raise e
-                if last_err:
-                    raise last_err
+                raw_response = generate_gemini_text(
+                    user_prompt, model_name=settings.gemini_model,
+                    api_key=settings.gemini_api_key, system_prompt=AMBIGUITY_SYSTEM_PROMPT,
+                    response_mime_type="application/json", config=settings,
+                )
+            elif active_provider == "groq":
+                if not settings.groq_api_key:
+                    return AmbiguityResult(False, "CLEAR", classification_succeeded=False,
+                        reasoning="Groq provider selected but GROQ_API_KEY is not configured.")
+                raw_response = generate_groq_text(user_prompt, model_name=settings.groq_model,
+                    api_key=settings.groq_api_key, system_prompt=AMBIGUITY_SYSTEM_PROMPT,
+                    response_mime_type="application/json", config=settings)
             elif active_provider == "openai":
                 if not settings.openai_api_key:
                     return AmbiguityResult(
@@ -286,4 +278,7 @@ class AmbiguityClassifier:
                 ambiguity_type="CLEAR",
                 reasoning=f"Fallback on classifier exception: {exc}",
                 classification_succeeded=False,
+                provider_failed=isinstance(exc, ProviderRequestError),
+                provider_error_code=getattr(exc, "code", None),
+                quota_kind=getattr(exc, "quota_kind", None),
             )

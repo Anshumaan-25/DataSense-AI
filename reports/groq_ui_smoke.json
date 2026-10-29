@@ -1,0 +1,14 @@
+{
+  "recorded_at_utc": "2026-10-29T17:24:02.569636+00:00",
+  "status": "SUCCESS",
+  "startup_exceptions": [],
+  "groq_sidebar_visible": true,
+  "benchmark_provider_options": [
+    "auto",
+    "groq",
+    "gemini",
+    "openai"
+  ],
+  "model": "qwen/qwen3.8-27b",
+  "api_calls_sent_by_this_check": 0
+}

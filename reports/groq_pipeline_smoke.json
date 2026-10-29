@@ -1,0 +1,23 @@
+{
+  "recorded_at_utc": "2026-10-29T17:13:42.923354+00:00",
+  "provider": "groq",
+  "model": "qwen/qwen3.8-27b",
+  "status": "SUCCESS",
+  "question": "How many nations are there?",
+  "classification": "CLEAR",
+  "classification_succeeded": true,
+  "generated_sql": "SELECT COUNT(*) AS nation_count\nFROM nation;",
+  "generated_result": [
+    {
+      "nation_count": 25
+    }
+  ],
+  "repaired_sql": "SELECT COUNT(*) FROM nation",
+  "repaired_result": [
+    {
+      "count_star()": 25
+    }
+  ],
+  "semantic_judge_status": "PASSED",
+  "provenance": "Live application classification, generation, repair, and judge calls on October 29, 2026. The verification script failed when serializing the execute_query tuple; this report consolidates its captured observations and rechecks repaired SQL locally without more model calls."
+}

@@ -1,0 +1,8 @@
+{
+  "model": "gemini-3.8-flash",
+  "endpoint": "interactions",
+  "status": "error",
+  "elapsed_s": 45.39,
+  "code": null,
+  "message": "Request timed out. This is a client-side timeout. You can increase the timeout by setting the `timeout` argument on your request or in the client http options."
+}

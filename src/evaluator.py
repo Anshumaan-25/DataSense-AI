@@ -303,6 +303,9 @@ class TaskResult:
     classification_succeeded: bool = True
     evaluation_error: bool = False
     order_sensitive: bool = False
+    provider_failed: bool = False
+    provider_error_code: Optional[int] = None
+    quota_kind: Optional[str] = None
 
 
 @dataclass
@@ -330,11 +333,16 @@ class BenchmarkReport:
     ambiguity_accuracy: float = 0.0
     metadata: Dict[str, Any] = field(default_factory=dict)
     evaluation_error_count: int = 0
+    expected_ex_eligible_tasks: Optional[int] = None
+
+    @property
+    def aborted(self) -> bool:
+        return bool(self.metadata.get("abort_reason"))
 
     def finalize(self) -> "BenchmarkReport":
         """Compute aggregate accuracy metrics from task-level results. Returns self."""
         eligible = [t for t in self.task_results if t.ex_eligible]
-        self.ex_eligible_tasks = len(eligible)
+        self.ex_eligible_tasks = self.expected_ex_eligible_tasks if self.expected_ex_eligible_tasks is not None else len(eligible)
 
         self.pass_at_1_count = sum(1 for t in eligible if t.pass_at_1 is True)
         self.pass_at_n_count = sum(1 for t in eligible if t.pass_at_n is True)
@@ -350,7 +358,7 @@ class BenchmarkReport:
         self.pass_at_1_accuracy = (self.pass_at_1_count / n * 100) if n > 0 else 0.0
         self.pass_at_n_accuracy = (self.pass_at_n_count / n * 100) if n > 0 else 0.0
         self.self_correction_delta = self.pass_at_n_accuracy - self.pass_at_1_accuracy
-        self.avg_latency_ms = (self.total_latency_ms / self.total_tasks) if self.total_tasks > 0 else 0.0
+        self.avg_latency_ms = (self.total_latency_ms / len(self.task_results)) if self.task_results else 0.0
         self.ambiguity_accuracy = (
             (self.ambiguity_correct_count / self.ambiguity_tasks * 100)
             if self.ambiguity_tasks > 0 else 0.0
@@ -363,14 +371,15 @@ class BenchmarkReport:
             "summary": {
                 "total_tasks": self.total_tasks,
                 "ex_eligible_tasks": self.ex_eligible_tasks,
-                "pass_at_1_accuracy_pct": round(self.pass_at_1_accuracy, 2),
-                "pass_at_n_accuracy_pct": round(self.pass_at_n_accuracy, 2),
-                "self_correction_delta_pct": round(self.self_correction_delta, 2),
+                "pass_at_1_accuracy_pct": None if self.aborted else round(self.pass_at_1_accuracy, 2),
+                "pass_at_n_accuracy_pct": None if self.aborted else round(self.pass_at_n_accuracy, 2),
+                "self_correction_delta_pct": None if self.aborted else round(self.self_correction_delta, 2),
                 "avg_latency_ms": round(self.avg_latency_ms, 2),
                 "semantic_repair_count": self.semantic_repair_count,
-                "ambiguity_classifier_accuracy_pct": round(self.ambiguity_accuracy, 2),
+                "ambiguity_classifier_accuracy_pct": None if self.aborted else round(self.ambiguity_accuracy, 2),
                 "evaluation_error_count": self.evaluation_error_count,
-                "run_status": "COMPLETED_WITH_ERRORS" if self.evaluation_error_count else "COMPLETED",
+                "run_status": "ABORTED_PROVIDER_ERROR" if self.aborted else "COMPLETED_WITH_ERRORS" if self.evaluation_error_count else "COMPLETED",
+                "completed_tasks": len(self.task_results),
             },
             "metadata": self.metadata,
             "tasks": [
@@ -399,6 +408,9 @@ class BenchmarkReport:
                     "classification_succeeded": t.classification_succeeded,
                     "evaluation_error": t.evaluation_error,
                     "order_sensitive": t.order_sensitive,
+                    "provider_failed": t.provider_failed,
+                    "provider_error_code": t.provider_error_code,
+                    "quota_kind": t.quota_kind,
                 }
                 for t in self.task_results
             ],
@@ -470,14 +482,15 @@ class BenchmarkRunner:
             tasks = json.load(handle)
         references = self._prepare_tasks(tasks)
         provider = self.provider or settings.get_effective_provider()
-        report = BenchmarkReport(total_tasks=len(tasks), metadata={
+        report = BenchmarkReport(total_tasks=len(tasks), expected_ex_eligible_tasks=len(references), metadata={
             "protocol": "single_trajectory_v1",
             "pass_at_1": "first observed pipeline attempt passed validation and matched gold",
             "pass_at_n": "final successful pipeline output matched gold within the attempt budget",
             "gold_feedback_to_pipeline": False,
             "max_attempts": self.max_retries,
             "provider": provider,
-            "model": settings.gemini_model if provider == "gemini" else settings.openai_model if provider == "openai" else None,
+            "model": {"gemini": settings.gemini_model, "groq": settings.groq_model,
+                "openai": settings.openai_model}.get(provider),
             "comparison": self.comparator.policy(),
             "benchmark_sha256": hashlib.sha256(benchmark_path.read_bytes()).hexdigest(),
             "started_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -498,6 +511,9 @@ class BenchmarkRunner:
                 ambiguity = self._classify_ambiguity(record.question)
                 record.ambiguity_predicted = ambiguity.ambiguity_type
                 record.classification_succeeded = ambiguity.classification_succeeded
+                record.provider_failed = ambiguity.provider_failed
+                record.provider_error_code = ambiguity.provider_error_code
+                record.quota_kind = ambiguity.quota_kind
                 record.ambiguity_correct = ambiguity.classification_succeeded and ambiguity.ambiguity_type == record.expected_ambiguity
                 if not ambiguity.classification_succeeded:
                     record.evaluation_error = True
@@ -507,7 +523,7 @@ class BenchmarkRunner:
                     record.clarified_context = ambiguity.default_interpretation
                 # A predicted HARD_AMBIGUITY pauses just as the assistant UI does.
                 # Expected-HARD tasks remain classifier-only even if misclassified.
-                if record.ex_eligible and not record.needs_clarification:
+                if record.ex_eligible and ambiguity.classification_succeeded and not record.needs_clarification:
                     result = self._pipeline.execute_with_repair(
                         record.question, max_retries=self.max_retries,
                         provider=self.provider, clarified_context=record.clarified_context,
@@ -531,6 +547,11 @@ class BenchmarkRunner:
                         record.error_message = "; ".join(filter(None, (record.error_message, result.error_message)))
                     if any(attempt.error_type == "GENERATION_FAILURE" for attempt in result.attempts):
                         record.evaluation_error = True
+                    for attempt in result.attempts:
+                        if attempt.provider_failed:
+                            record.provider_failed = True
+                            record.provider_error_code = attempt.provider_error_code
+                            record.quota_kind = attempt.quota_kind
             except Exception as exc:
                 record.evaluation_error = True
                 if record.ambiguity_correct is None:
@@ -541,4 +562,10 @@ class BenchmarkRunner:
             report.task_results.append(record)
             if progress_callback is not None:
                 progress_callback(index + 1, len(tasks), record.task_id)
+            if record.provider_failed:
+                report.metadata["abort_reason"] = {
+                    "code": record.provider_error_code, "quota_kind": record.quota_kind,
+                    "task_id": record.task_id, "message": record.error_message,
+                }
+                break
         return report.finalize()

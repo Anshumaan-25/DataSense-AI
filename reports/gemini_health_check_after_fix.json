@@ -1,0 +1,12 @@
+{
+  "recorded_at_utc": "2026-10-29T15:52:37.572943+00:00",
+  "model": "gemini-3.6-flash",
+  "timeout_seconds": 60.0,
+  "max_attempts": 1,
+  "thinking_level": "low",
+  "endpoint": "generateContent",
+  "business_data_sent": false,
+  "status": "SUCCESS",
+  "response": "OK",
+  "elapsed_seconds": 3.41
+}

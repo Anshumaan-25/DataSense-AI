@@ -21,6 +21,8 @@ from sqlglot import exp
 from sqlglot.optimizer.scope import Scope, build_scope, traverse_scope
 
 from src.config import settings
+from src.llm import generate_gemini_text
+from src.groq_client import generate_groq_text
 from src.database import DistinctValueProfile, get_distinct_value_profile
 
 
@@ -463,34 +465,16 @@ Output strictly a JSON object:
                 if active_provider == "gemini":
                     if not settings.gemini_api_key:
                         return SemanticValidationResult(is_valid=True, judge_status="UNAVAILABLE")
-                    from google import genai
-                    from google.genai import types
-
-                    client = genai.Client(api_key=settings.gemini_api_key)
-                    import time
-                    last_err = None
-                    raw_response = ""
-                    for attempt in range(3):
-                        try:
-                            resp = client.models.generate_content(
-                                model=settings.gemini_model,
-                                contents=[judge_prompt],
-                                config=types.GenerateContentConfig(
-                                    response_mime_type="application/json",
-                                    temperature=0.0,
-                                ),
-                            )
-                            raw_response = resp.text or ""
-                            last_err = None
-                            break
-                        except Exception as e:
-                            last_err = e
-                            if ("503" in str(e) or "429" in str(e) or "UNAVAILABLE" in str(e)) and attempt < 2:
-                                time.sleep(1.5 * (attempt + 1))
-                                continue
-                            raise e
-                    if last_err:
-                        raise last_err
+                    raw_response = generate_gemini_text(
+                        judge_prompt, model_name=settings.gemini_model,
+                        api_key=settings.gemini_api_key, response_mime_type="application/json",
+                        config=settings,
+                    )
+                elif active_provider == "groq":
+                    if not settings.groq_api_key:
+                        return SemanticValidationResult(is_valid=True, judge_status="UNAVAILABLE")
+                    raw_response = generate_groq_text(judge_prompt, model_name=settings.groq_model,
+                        api_key=settings.groq_api_key, response_mime_type="application/json", config=settings)
                 elif active_provider == "openai":
                     if not settings.openai_api_key:
                         return SemanticValidationResult(is_valid=True, judge_status="UNAVAILABLE")

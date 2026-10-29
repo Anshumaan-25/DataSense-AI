@@ -51,6 +51,19 @@ def test_cli_writes_auditable_report_and_respects_read_only(cli_environment):
     assert report["tasks"][0]["first_sql"] == "SELECT COUNT(*) AS total FROM nation"
 
 
+def test_cli_accepts_groq_override_and_records_actual_model(cli_environment, monkeypatch):
+    from src import evaluator
+    output, _, _ = cli_environment
+    policy = replace(cli.settings, llm_provider="groq", groq_api_key="test", groq_model="qwen/qwen3.8-27b")
+    monkeypatch.setattr(cli, "settings", policy)
+    monkeypatch.setattr(evaluator, "settings", policy)
+    monkeypatch.setattr(sys, "argv", [*sys.argv, "--provider", "groq"])
+    assert cli.main() == 0
+    report = json.loads(output.read_text())
+    assert report["metadata"]["provider"] == "groq"
+    assert report["metadata"]["model"] == "qwen/qwen3.8-27b"
+
+
 def test_cli_returns_failure_status_when_provider_generation_fails(cli_environment, monkeypatch):
     output, _, make_runner = cli_environment
 
@@ -92,3 +105,27 @@ def test_cli_rejects_malformed_dataset_before_database_setup(cli_environment):
     dataset.write_text("{broken json")
     assert cli.main() == 1
     connection.assert_not_called()
+
+
+def test_cli_aborts_on_daily_quota_without_publishing_zero_accuracy(cli_environment, monkeypatch, capsys):
+    from pathlib import Path
+    from src.llm import GeminiRequestError
+    output, _, make_runner = cli_environment
+    dataset = Path(sys.argv[sys.argv.index("--benchmark") + 1])
+    tasks = json.loads(dataset.read_text())
+    dataset.write_text(json.dumps([*tasks, {**tasks[0], "id": "second"}]))
+    generate = MagicMock(side_effect=GeminiRequestError("model", 1, 429, "Daily quota exhausted", quota_kind="daily"))
+
+    def quota_runner(**kwargs):
+        runner = make_runner(**kwargs)
+        runner._pipeline.generator_fn = generate
+        return runner
+
+    monkeypatch.setattr(cli, "BenchmarkRunner", quota_runner)
+    assert cli.main() == 2
+    generate.assert_called_once()
+    report = json.loads(output.read_text())
+    assert report["summary"]["run_status"] == "ABORTED_PROVIDER_ERROR"
+    assert report["summary"]["completed_tasks"] == 1
+    assert report["summary"]["pass_at_n_accuracy_pct"] is None
+    assert "Accuracy is unmeasured" in capsys.readouterr().out

@@ -1,6 +1,6 @@
 # DataSense AI ⚡
 
-Production-grade Text-to-SQL system powered by **DuckDB**, **ChromaDB Schema-Aware RAG**, **TPC-H analytical benchmark data**, **AST query safety validation via `sqlglot`**, and multi-provider LLM support (**Google Gemini & OpenAI**) wrapped in an interactive **Streamlit** user interface.
+Production-grade Text-to-SQL system powered by **DuckDB**, **ChromaDB Schema-Aware RAG**, **TPC-H analytical benchmark data**, **AST query safety validation via `sqlglot`**, and multi-provider LLM support (**Groq, Google Gemini & OpenAI**) wrapped in an interactive **Streamlit** user interface.
 
 ---
 
@@ -66,7 +66,7 @@ Production-grade Text-to-SQL system powered by **DuckDB**, **ChromaDB Schema-Awa
  │  • Tab 2: 📊 Evaluation Benchmark                    │
  │    - Execution Accuracy (EX) Benchmark Suite         │
  │    - Pass@1 vs. Repaired Pass@N Comparison            │
- │    - Latency & Token Telemetry Breakdown              │
+ │    - Latency & Per-Attempt Outcome Breakdown          │
  └───────────────────────────────────────────────────────┘
 ```
 
@@ -82,7 +82,9 @@ DataSense AI/
 │   ├── benchmark_queries.json   # 20 diverse TPC-H evaluation benchmark queries
 │   └── chroma_storage/          # Generated persistent vector index (git-ignored)
 ├── scripts/
-│   └── run_benchmark.py         # Standalone CLI evaluation & benchmark suite
+│   ├── run_benchmark.py         # Standalone CLI evaluation & benchmark suite
+│   ├── diagnose_gemini.py       # Bounded Gemini inference health check
+│   └── diagnose_groq.py         # One-request Groq JSON inference health check
 ├── src/
 │   ├── __init__.py              # Package initialization
 │   ├── config.py                # Environment variables, provider settings, and paths
@@ -91,6 +93,8 @@ DataSense AI/
 │   ├── retriever.py             # ChromaDB semantic vector search for metrics & schema
 │   ├── ambiguity.py             # 3-Tier intent ambiguity classifier & clarification agent
 │   ├── generator.py             # LLM prompt construction with RAG context & repair reflection
+│   ├── llm.py                   # Shared Gemini deadlines, retries, thinking, and request pacing
+│   ├── groq_client.py           # Groq deadlines, retries, request/token pacing, and redacted errors
 │   ├── semantic.py              # 2-Stage silent execution & semantic validation engine
 │   ├── pipeline.py              # Bounded self-correction repair state machine (N ≤ 3)
 │   ├── evaluator.py             # DataFrame normalizer, EX comparator & benchmark harness
@@ -116,6 +120,8 @@ DataSense AI/
 
 ### 1. Clone & Set Up Virtual Environment
 
+Use Python 3.10 or newer; the current SDK and test suite were verified on Python 3.13.13.
+
 ```bash
 python3 -m venv venv
 source venv/bin/activate
@@ -133,14 +139,28 @@ cp .env.example .env
 Edit `.env` to configure your preferred LLM provider:
 
 ```env
-# Provider choice: "auto", "gemini", or "openai"
-LLM_PROVIDER=auto
+# Provider choice: "auto", "groq", "gemini", or "openai"
+LLM_PROVIDER=groq
 
-# Option A: Google Gemini (Recommended)
+# Option A: Groq (recommended for free development)
+GROQ_API_KEY=your_groq_api_key_here
+GROQ_MODEL=qwen/qwen3.8-27b
+GROQ_TIMEOUT_SECONDS=120
+GROQ_MAX_ATTEMPTS=3
+GROQ_MAX_OUTPUT_TOKENS=2048
+GROQ_REQUESTS_PER_MINUTE=6
+GROQ_TOKENS_PER_MINUTE=7000
+
+# Option B: Google Gemini
 GEMINI_API_KEY=your_gemini_api_key_here
-GEMINI_MODEL=gemini-3.8-flash
+GEMINI_MODEL=gemini-3.6-flash
+GEMINI_TIMEOUT_SECONDS=60
+GEMINI_MAX_ATTEMPTS=3
+GEMINI_THINKING_LEVEL=low
+GEMINI_MAX_OUTPUT_TOKENS=4096
+GEMINI_REQUESTS_PER_MINUTE=4
 
-# Option B: OpenAI
+# Option C: OpenAI
 OPENAI_API_KEY=your_openai_api_key_here
 OPENAI_MODEL=gpt-4o-mini
 
@@ -212,7 +232,7 @@ Run the full pytest suite:
 pytest tests/ -v
 ```
 
-All 225 tests cover:
+All 325 tests cover:
 - TPC-H table generation and idempotency.
 - Schema extraction (dictionary and prompt-ready DDL string).
 - Valid query execution and query error handling.
@@ -239,10 +259,13 @@ All 225 tests cover:
 - Resilient JSON parsing and graceful fallback on malformed model responses.
 - Interactive user clarification persistence across the self-correction repair loop.
 - Semantic validation: column-aware casing repair from profiled values, including aliases, IN predicates, escaped literals, case collisions, and NULL scalar aggregates.
-- Conversion/type repair samples: bounded rows, physical-table/CTE resolution, security boundaries, sampling failure fallback, and Gemini/OpenAI prompt integration.
+- Conversion/type repair samples: bounded rows, physical-table/CTE resolution, security boundaries, sampling failure fallback, and Groq/Gemini/OpenAI prompt integration.
 - Semantic validation: multi-table row explosion detection (more than 1,000 rows without grouping or a limit).
 - Semantic validation: requested catalog formulas compared as ASTs, including aliases, ROUND/CAST wrappers, commutative operands, CTE/derived output columns, and rejection of formula decoys outside the output.
 - Actual first-attempt telemetry, preserved ambiguity defaults, safe gold-query preflight, classifier error accounting, and CLI integration/error exits.
+- Shared Gemini transport: shrinking deadlines, capped transient retries, permanent-error handling, retry-delay hints, quota pacing, immediate daily-quota failure, client cleanup, secret redaction, and generation/diagnostic CLI integration.
+- Groq integration: all model stages, native JSON mode, provider selection, request and rolling token pacing, retry deadlines, daily quotas, cleanup, secret redaction, and the diagnostic/benchmark CLI.
+- Provider-aware evaluation: failed classification prevents dependent generation; fatal Gemini/Groq errors abort the run and export null accuracy fields rather than a misleading quality score.
 - EX comparison: output aliases and column order are ignored using one global mapping; complete rows and duplicate multiplicity must match. Original numeric values use absolute tolerance 0.01 and zero relative tolerance. Nulls match nulls; string case is preserved. A task can set `order_sensitive: true` to require row order. Strict column-name or case-insensitive string comparison are explicit comparator options.
 - Benchmark suite: Pass@1 and Pass@N observe the same initial SQL and repair trajectory. Gold outputs never drive repairs. Exports include the protocol, first SQL/error, provider/model, dataset hash, comparison policy, latency, and classifier/error status. Token telemetry is not currently recorded.
 
@@ -251,12 +274,24 @@ The legacy `DataFrameNormalizer` display utility is not used for EX scoring. The
 Run a live benchmark against an existing database with:
 
 ```bash
-python3 scripts/run_benchmark.py --read-only --output reports/correctness_sprint_benchmark.json
+python3 scripts/run_benchmark.py --provider groq --read-only --output reports/groq_free_tier_benchmark.json
 ```
 
-CLI exit codes are 0 for completion, 1 for setup/reference errors, and 2 for a completed run with evaluation/provider errors. Top-N references include deterministic tie rules; SOFT_DEFAULT order browsing uses order date descending, then order key descending, with LIMIT 10.
+CLI exit codes are 0 for completion, 1 for setup/reference errors, and 2 for evaluation/provider errors, including an aborted run. Top-N references include deterministic tie rules; SOFT_DEFAULT order browsing uses order date descending, then order key descending, with LIMIT 10.
 
-The October 29 live attempt stopped during the first task after a separate Gemini generation probe returned `504 DEADLINE_EXCEEDED`. Live accuracy is unmeasured; the attempted-run status is recorded in `reports/correctness_sprint_benchmark_status.json`. Offline verification passed 225 tests.
+For free development, configure **Groq** with `qwen/qwen3.8-27b`. The key was verified with real JSON generation and live classification, SQL execution, repair, and semantic judging. All stages share bounded retries and request/token pacing. The current local `.env` explicitly selects Groq. In `auto` mode, a configured Groq key takes precedence, followed by Gemini and OpenAI. A request never silently falls back to another provider/model. See [Groq setup and verification](docs/GROQ_SETUP.md).
+
+The October 29 Groq baseline completed **20/20 tasks with zero evaluation/provider errors**: **94.44% Pass@1 and Pass@N (17/18 SQL tasks)** and **100% ambiguity classification accuracy**. The RAG-enabled run took 601 seconds, including free-tier pacing. One supplier lookup selected names only while the reference also requires supplier key and account balance. No repair occurred in this baseline; repair and optional judging were separately verified live. See `reports/groq_free_tier_benchmark.json` and `reports/groq_ui_smoke.json`. These results describe one small benchmark, not general SQL accuracy.
+
+The original October 29 attempts on Gemini 3.8 timed out; the same key worked with Gemini 3.6, which then exhausted its 20-call daily allowance. This model-specific Gemini quota does not prevent using Groq's free tier. The full benchmark needs at least 38 calls before retries. Historical Gemini reports with provider errors remain diagnostic evidence rather than clean quality measurements; see `reports/gemini_failure_diagnosis.json`.
+
+For a bounded, synthetic generation health check:
+
+```bash
+python3 scripts/diagnose_groq.py --output reports/groq_health_check.json
+```
+
+Restart Streamlit after changing `.env` to reload the frozen settings. Groq pacing is per process and key/model; other applications or keys in the same organization share the provider limits. The [Gemini troubleshooting guide](docs/GEMINI_TROUBLESHOOTING.md) remains available for explicitly selected Gemini runs.
 
 ---
 

@@ -23,6 +23,7 @@ from src.generator import generate_sql, generate_repaired_sql
 from src.retriever import SchemaMetricRetriever
 from src.ambiguity import AmbiguityClassifier, AmbiguityResult
 from src.semantic import SemanticValidator, SemanticValidationResult
+from src.llm import ProviderRequestError
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,9 @@ class PipelineAttempt:
     df: Optional[pd.DataFrame] = None
     error_type: str = ""
     error_message: str = ""
+    provider_failed: bool = False
+    provider_error_code: Optional[int] = None
+    quota_kind: Optional[str] = None
 
 
 @dataclass
@@ -172,7 +176,7 @@ class SelfCorrectingPipeline:
             user_question: Natural language question submitted by user.
             schema_info: Database DDL or table schema summary (defaults to DB schema).
             rag_context: Business metric and filter rules retrieved via RAG.
-            provider: LLM provider override ('gemini', 'openai').
+            provider: LLM provider override ('groq', 'gemini', 'openai').
 
         Returns:
             AmbiguityResult with 3-tier classification, reasoning, and structured options.
@@ -267,6 +271,9 @@ class SelfCorrectingPipeline:
                 if not isinstance(current_sql, str):
                     raise TypeError("The model must return a SQL string.")
             except Exception as exc:
+                outcome.provider_failed = isinstance(exc, ProviderRequestError)
+                outcome.provider_error_code = getattr(exc, "code", None)
+                outcome.quota_kind = getattr(exc, "quota_kind", None)
                 record_failure("GENERATION_FAILURE", str(exc))
                 result.error_message = f"Model generation error: {exc}"
                 break

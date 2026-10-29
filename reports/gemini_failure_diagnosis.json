@@ -1,0 +1,76 @@
+{
+  "recorded_at_utc": "2026-10-29T16:20:15.749189+00:00",
+  "status": "CODE_FIX_VERIFIED_OFFLINE_ACCOUNT_QUOTA_BLOCKS_CLEAN_LIVE_BASELINE",
+  "original_failure": {
+    "model": "gemini-3.8-flash",
+    "endpoint": "https://generativelanguage.googleapis.com/",
+    "metadata_accessible": true,
+    "tiny_generation_prompt": "Return only the text OK.",
+    "low_thinking_http_code": 504,
+    "low_thinking_elapsed_seconds": 58.72,
+    "default_thinking_http_code": 504,
+    "default_thinking_elapsed_seconds": 58.66,
+    "interactions_client_timeout_seconds": 45.39,
+    "inference": "Observed failure isolated to this model generation path with this key. Google internal backend cause is not visible to this client."
+  },
+  "recovery_evidence": {
+    "same_key_model": "gemini-3.6-flash",
+    "tiny_generation_response": "OK",
+    "tiny_generation_elapsed_seconds": 6.75,
+    "application_sql": "SELECT 1 AS ok;",
+    "application_sql_elapsed_seconds": 2.03,
+    "application_sql_executed_successfully": true,
+    "effective_original_sdk_timeout": null,
+    "effective_original_sdk_attempts": 1,
+    "nested_sdk_retries_observed": false
+  },
+  "remaining_external_blocker": {
+    "http_code": 429,
+    "requests_per_minute_limit": 5,
+    "requests_per_day_limit": 20,
+    "daily_quota_id": "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+    "daily_quota_exhausted": true,
+    "next_documented_reset_ist": "2026-10-30T12:30:00+05:30",
+    "benchmark_tasks": 20,
+    "minimum_full_benchmark_model_calls": 38,
+    "daily_reset_alone_suffices_for_full_benchmark": false,
+    "account_action": "Complete billing/paid-tier setup for the project owning the API key and verify sufficient active project/model daily quota, or wait for a reset for a smaller workload.",
+    "no_further_live_requests_after_daily_limit_identified": true
+  },
+  "implemented_policy": {
+    "default_model": "gemini-3.6-flash",
+    "logical_request_budget_seconds": 60,
+    "max_application_attempts": 3,
+    "sdk_attempts": 1,
+    "local_requests_per_minute": 4,
+    "pacing_scope": "process, API key, model",
+    "daily_quota_fail_fast": true,
+    "classification_failure_prevents_sql_generation": true,
+    "fatal_gemini_provider_error_aborts_benchmark": true,
+    "aborted_accuracy_fields": null
+  },
+  "validation": {
+    "offline_tests_passed": 276,
+    "offline_tests_failed": 0,
+    "offline_elapsed_seconds": 11.6,
+    "python_version": "3.13.13",
+    "live_full_clean_baseline_available": false,
+    "pass_at_1_accuracy_pct": null,
+    "pass_at_n_accuracy_pct": null,
+    "note": "Recovery benchmark reports predate the provider-abort guard and contain provider errors; their numerical scores are not a clean quality baseline."
+  },
+  "evidence_files": [
+    "reports/gemini_latency_diagnostics.json",
+    "reports/gemini_interactions_diagnostics.json",
+    "reports/gemini_alternate_model_diagnostics.json",
+    "reports/gemini_health_check_after_fix.json",
+    "reports/gemini_recovery_benchmark.json",
+    "reports/gemini_recovery_paced_benchmark.json"
+  ],
+  "operator_guide": "docs/GEMINI_TROUBLESHOOTING.md",
+  "official_references": [
+    "https://ai.google.dev/gemini-api/docs/api-errors",
+    "https://ai.google.dev/gemini-api/docs/rate-limits",
+    "https://ai.google.dev/gemini-api/docs/billing"
+  ]
+}

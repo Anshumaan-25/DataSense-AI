@@ -584,3 +584,31 @@ class TestBenchmarkRunner:
         assert data["metadata"]["comparison"]["absolute_tolerance"] == "0.01"
         assert len(data["metadata"]["benchmark_sha256"]) == 64
         assert data["tasks"][0]["first_sql"] == "SELECT COUNT(*) FROM nation"
+
+    @pytest.mark.parametrize("failure_stage", ["classification", "generation"])
+    @pytest.mark.parametrize("provider", ["gemini", "groq"])
+    def test_provider_daily_quota_aborts_without_publishing_accuracy(self, failure_stage, provider):
+        from src.ambiguity import AmbiguityClassifier
+        from src.llm import GeminiRequestError
+        from src.groq_client import GroqRequestError
+        tasks = [{"id": f"quota_{index}", "question": "How many nations?", "ground_truth_sql": "SELECT COUNT(*) FROM nation"} for index in range(3)]
+        runner = self._make_runner(generator_fn=MagicMock(return_value="SELECT COUNT(*) FROM nation"))
+        error_class = GroqRequestError if provider == "groq" else GeminiRequestError
+        fail = MagicMock(side_effect=error_class("model", 1, 429, "Daily quota exhausted", quota_kind="daily"))
+        if failure_stage == "classification":
+            runner._pipeline.classifier = AmbiguityClassifier(classifier_fn=fail)
+        else:
+            runner._pipeline.classifier = AmbiguityClassifier(classifier_fn=lambda prompt: '{"ambiguity_type":"CLEAR"}')
+            runner._pipeline.generator_fn = fail
+        report = runner.run_benchmark(self._make_benchmark_file(tasks))
+        exported = report.to_dict()
+        fail.assert_called_once()
+        assert report.aborted and len(report.task_results) == 1
+        assert report.ex_eligible_tasks == 3
+        assert exported["summary"]["run_status"] == "ABORTED_PROVIDER_ERROR"
+        assert exported["summary"]["pass_at_1_accuracy_pct"] is None
+        assert exported["summary"]["pass_at_n_accuracy_pct"] is None
+        assert exported["summary"]["ambiguity_classifier_accuracy_pct"] is None
+        assert exported["metadata"]["abort_reason"]["quota_kind"] == "daily"
+        if failure_stage == "classification":
+            runner._pipeline.generator_fn.assert_not_called()

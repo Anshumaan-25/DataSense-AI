@@ -10,7 +10,7 @@ Usage:
 Exit codes:
     0 — Benchmark completed (regardless of Pass@N score).
     1 — Fatal setup error (missing file, DB init failure, etc.).
-    2 — Benchmark completed with evaluation/provider errors; inspect the report.
+    2 — Evaluation/provider errors, including an aborted provider-failed run.
 """
 
 from __future__ import annotations
@@ -101,6 +101,10 @@ def print_summary(report: BenchmarkReport, output_path: Path) -> None:
             GREEN(f"{report.ambiguity_accuracy:.1f}%") if report.ambiguity_accuracy >= 70
             else YELLOW(f"{report.ambiguity_accuracy:.1f}%")),
     ]
+    if report.aborted:
+        print(RED(f"  Provider failure: stopped after {len(report.task_results)}/{report.total_tasks} tasks. Accuracy is unmeasured."))
+        rows = [(label, "N/A" if label in ("Pass@1 Accuracy", "Pass@N Final Accuracy", "Self-Correction Lift Δ EX", "Ambiguity Classifier Accuracy") else value) for label, value in rows]
+        rows[0] = ("Tasks Completed", f"{len(report.task_results)}/{report.total_tasks}")
 
     col_w = 34
     print(f"  {'Metric':<{col_w}}  {'Value'}")
@@ -153,7 +157,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--provider",
         default=None,
-        choices=["gemini", "openai"],
+        choices=["gemini", "groq", "openai"],
         help="LLM provider override. Defaults to auto-detection from .env.",
     )
     parser.add_argument(
@@ -177,7 +181,8 @@ def main() -> int:
         print(RED("✗ --retries must be at least 1."), file=sys.stderr)
         return 1
     provider = args.provider or settings.get_effective_provider()
-    if provider == "none" or (provider == "gemini" and not settings.gemini_api_key) or (provider == "openai" and not settings.openai_api_key):
+    if not {"gemini": settings.gemini_api_key, "groq": settings.groq_api_key,
+            "openai": settings.openai_api_key}.get(provider):
         print(RED("✗ Configure an API key for the selected provider before live benchmarking."), file=sys.stderr)
         return 1
 
@@ -202,7 +207,7 @@ def main() -> int:
 
     print(BOLD(f"\n  DataSense AI — TPC-H Benchmark Suite"))
     print(DIM(f"  Benchmark: {benchmark_path}"))
-    print(DIM(f"  Provider:  {args.provider or 'auto'}"))
+    print(DIM(f"  Provider:  {provider}"))
     print(DIM(f"  Retries:   {args.retries}"))
     print()
 

@@ -6,6 +6,8 @@ import json
 import re
 from typing import Any, Optional
 from src.config import settings
+from src.llm import generate_gemini_text
+from src.groq_client import generate_groq_text
 
 SYSTEM_PROMPT = """You are a Senior Data Engineer specializing in DuckDB and TPC-H analytics.
 Given a database schema and a natural language user question, generate a correct, optimal, and strictly read-only DuckDB SQL query.
@@ -57,31 +59,11 @@ def _call_gemini(
     api_key: str,
     system_prompt: str = SYSTEM_PROMPT,
 ) -> str:
-    """Invoke Google Gemini model using the official google-genai SDK with retry on transient errors."""
-    import time
-    from google import genai
-
-    client = genai.Client(api_key=api_key)
-    last_err = None
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=[
-                    system_prompt,
-                    user_prompt,
-                ],
-            )
-            return response.text or ""
-        except Exception as e:
-            last_err = e
-            if ("503" in str(e) or "429" in str(e) or "UNAVAILABLE" in str(e)) and attempt < 2:
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            raise e
-    if last_err:
-        raise last_err
-    return ""
+    """Invoke Gemini with the shared deadline, reasoning, and retry policy."""
+    return generate_gemini_text(
+        user_prompt, model_name=model_name, api_key=api_key,
+        system_prompt=system_prompt, config=settings,
+    )
 
 
 def _call_openai(
@@ -105,6 +87,11 @@ def _call_openai(
     return response.choices[0].message.content or ""
 
 
+def _call_groq(user_prompt: str, model_name: str, api_key: str, system_prompt: str = SYSTEM_PROMPT) -> str:
+    return generate_groq_text(user_prompt, model_name=model_name, api_key=api_key,
+        system_prompt=system_prompt, config=settings)
+
+
 def generate_sql(
     user_question: str,
     schema_info: str,
@@ -119,7 +106,7 @@ def generate_sql(
         schema_info: Extracted DDL/schema text.
         rag_context: Optional business metric/filter RAG context retrieved via ChromaDB.
         clarified_context: Optional user clarification of ambiguous intent or default rule.
-        provider: 'gemini', 'openai', or None (uses config auto-detection).
+        provider: 'gemini', 'groq', 'openai', or None (uses config auto-detection).
 
     Returns:
         Clean, executable SQL query string.
@@ -155,6 +142,11 @@ def generate_sql(
             model_name=settings.gemini_model,
             api_key=settings.gemini_api_key,
         )
+    elif active_provider == "groq":
+        if not settings.groq_api_key:
+            raise ValueError("Groq provider selected but GROQ_API_KEY is not set.")
+        raw_response = _call_groq(user_prompt=user_prompt,
+            model_name=settings.groq_model, api_key=settings.groq_api_key)
     elif active_provider == "openai":
         if not settings.openai_api_key:
             raise ValueError(
@@ -167,7 +159,7 @@ def generate_sql(
         )
     else:
         raise ValueError(
-            "No LLM API key detected. Please configure GEMINI_API_KEY or OPENAI_API_KEY "
+            "No LLM API key detected. Please configure GROQ_API_KEY, GEMINI_API_KEY or OPENAI_API_KEY "
             "in your .env file or environment variables to enable Text-to-SQL generation."
         )
 
@@ -215,7 +207,7 @@ def generate_repaired_sql(
         error_message: The compiler or AST validation error message.
         attempt_history: Prior attempt history list.
         clarified_context: Optional user clarification of ambiguous intent or default rule.
-        provider: 'gemini', 'openai', or None (uses config auto-detection).
+        provider: 'gemini', 'groq', 'openai', or None (uses config auto-detection).
         table_samples: Up to three rows per referenced table for conversion/type repairs.
 
     Returns:
@@ -269,6 +261,12 @@ def generate_repaired_sql(
             api_key=settings.gemini_api_key,
             system_prompt=REPAIR_SYSTEM_PROMPT,
         )
+    elif active_provider == "groq":
+        if not settings.groq_api_key:
+            raise ValueError("Groq provider selected but GROQ_API_KEY is not set.")
+        raw_response = _call_groq(user_prompt=user_prompt,
+            model_name=settings.groq_model, api_key=settings.groq_api_key,
+            system_prompt=REPAIR_SYSTEM_PROMPT)
     elif active_provider == "openai":
         if not settings.openai_api_key:
             raise ValueError(
@@ -282,7 +280,7 @@ def generate_repaired_sql(
         )
     else:
         raise ValueError(
-            "No LLM API key detected. Please configure GEMINI_API_KEY or OPENAI_API_KEY "
+            "No LLM API key detected. Please configure GROQ_API_KEY, GEMINI_API_KEY or OPENAI_API_KEY "
             "in your .env file or environment variables to enable Text-to-SQL generation."
         )
 

@@ -1,0 +1,22 @@
+{
+  "started_at_utc": "2026-10-29T15:44:05.401097+00:00",
+  "model": "gemini-3.8-flash",
+  "results": [
+    {
+      "thinking_level": "low",
+      "elapsed_s": 58.72,
+      "status": "error",
+      "error_type": "ServerError",
+      "code": 504,
+      "message": "504 DEADLINE_EXCEEDED. {'error': {'code': 504, 'message': 'Deadline expired before operation could complete.', 'status': 'DEADLINE_EXCEEDED'}}"
+    },
+    {
+      "thinking_level": "model_default",
+      "elapsed_s": 58.66,
+      "status": "error",
+      "error_type": "ServerError",
+      "code": 504,
+      "message": "504 DEADLINE_EXCEEDED. {'error': {'code': 504, 'message': 'Deadline expired before operation could complete.', 'status': 'DEADLINE_EXCEEDED'}}"
+    }
+  ]
+}

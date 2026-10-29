@@ -153,9 +153,12 @@ with st.sidebar:
         st.success(f"🤖 LLM: **Gemini** (`{settings.gemini_model}`)")
     elif provider == "openai":
         st.success(f"🤖 LLM: **OpenAI** (`{settings.openai_model}`)")
+    elif provider == "groq":
+        st.success(f"🤖 LLM: **Groq** (`{settings.groq_model}`)")
+        st.caption("Requests may pause briefly to stay within your plan's request and token limits.")
     else:
         st.warning("⚠️ No API Key Configured in `.env`")
-        st.info("Set `GEMINI_API_KEY` or `OPENAI_API_KEY` in `.env` to enable live LLM generation.")
+        st.info("Set `GROQ_API_KEY`, `GEMINI_API_KEY` or `OPENAI_API_KEY` in `.env` to enable live LLM generation.")
 
     st.divider()
     st.subheader("📚 Business Metric Dictionary")
@@ -285,7 +288,10 @@ with tab_qa:
                         rag_context=rag_context,
                     )
     
-                if amb_res.is_ambiguous:
+                if not amb_res.classification_succeeded:
+                    st.error(f"Intent analysis is unavailable. {amb_res.reasoning}")
+                    st.session_state.ambiguity_result = None
+                elif amb_res.is_ambiguous:
                     st.session_state.ambiguity_result = amb_res
                     st.session_state.pipeline_result = None
                 else:
@@ -517,7 +523,7 @@ with tab_bench:
     with bench_col1:
         bench_provider = st.selectbox(
             "LLM Provider",
-            ["auto", "gemini", "openai"],
+            ["auto", "groq", "gemini", "openai"],
             key="bench_provider_select",
         )
         bench_retries = st.slider("Max Self-Repair Retries", 1, 5, 3, key="bench_retries_slider")
@@ -567,7 +573,11 @@ with tab_bench:
                     progress_callback=_streamlit_progress,
                 )
                 st.session_state.benchmark_report = report
-                progress_bar.progress(1.0, text="✅ Benchmark complete!")
+                if report.aborted:
+                    progress_bar.progress(len(report.task_results) / total_tasks if total_tasks else 0,
+                        text="Stopped: model provider unavailable. Accuracy is unmeasured.")
+                else:
+                    progress_bar.progress(1.0, text="✅ Benchmark complete!")
                 status_text.empty()
             except Exception as _exc:
                 st.error(f"Benchmark failed: {_exc}")
@@ -579,6 +589,8 @@ with tab_bench:
 
     if report is not None:
         st.write("---")
+        if report.aborted:
+            st.error(f"Benchmark stopped after {len(report.task_results)}/{report.total_tasks} tasks because the provider is unavailable. Accuracy is unmeasured. {report.metadata['abort_reason']['message']}")
         if report.evaluation_error_count:
             st.warning(f"This run had {report.evaluation_error_count} evaluation/provider error(s). Review the exported diagnostics before interpreting accuracy.")
 
@@ -589,20 +601,20 @@ with tab_bench:
         with m2:
             st.metric(
                 "Pass@1 Accuracy",
-                f"{report.pass_at_1_accuracy:.1f}%",
+                "—" if report.aborted else f"{report.pass_at_1_accuracy:.1f}%",
                 delta=None,
             )
         with m3:
             st.metric(
                 "Pass@N Accuracy",
-                f"{report.pass_at_n_accuracy:.1f}%",
+                "—" if report.aborted else f"{report.pass_at_n_accuracy:.1f}%",
             )
         with m4:
             delta_val = report.self_correction_delta
             st.metric(
                 "Self-Correction Δ EX",
-                f"+{delta_val:.1f}%" if delta_val >= 0 else f"{delta_val:.1f}%",
-                delta=f"{delta_val:.1f}%",
+                "—" if report.aborted else f"+{delta_val:.1f}%" if delta_val >= 0 else f"{delta_val:.1f}%",
+                delta=None if report.aborted else f"{delta_val:.1f}%",
                 delta_color="normal",
             )
         with m5:
@@ -618,7 +630,7 @@ with tab_bench:
         with s2:
             st.metric(
                 "Ambiguity Classifier Accuracy",
-                f"{report.ambiguity_accuracy:.1f}%",
+                "—" if report.aborted else f"{report.ambiguity_accuracy:.1f}%",
             )
         with s3:
             st.metric("EX-Eligible Tasks", report.ex_eligible_tasks)

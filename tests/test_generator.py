@@ -40,18 +40,18 @@ def test_generate_sql_missing_keys_raises(monkeypatch):
     """Verify generate_sql raises ValueError when no API keys are configured."""
     from src import generator
     from src.config import Settings
-    monkeypatch.setattr(generator, "settings", Settings(gemini_api_key="", openai_api_key=""))
+    monkeypatch.setattr(generator, "settings", Settings(gemini_api_key="", openai_api_key="", groq_api_key=""))
     with pytest.raises(ValueError) as exc_info:
         generate_sql("Who are the top customers?", "CREATE TABLE customer (c_custkey BIGINT);")
     assert "API key" in str(exc_info.value)
 
 
-@pytest.mark.parametrize("provider", ["gemini", "openai"])
+@pytest.mark.parametrize("provider", ["gemini", "openai", "groq"])
 def test_repair_prompt_includes_samples_and_preserves_grounded_context(monkeypatch, provider):
     from src import generator
     from src.config import Settings
 
-    monkeypatch.setattr(generator, "settings", Settings(gemini_api_key="test", openai_api_key="test"))
+    monkeypatch.setattr(generator, "settings", Settings(gemini_api_key="test", openai_api_key="test", groq_api_key="test"))
     prompts = []
 
     def fake_provider(**kwargs):
