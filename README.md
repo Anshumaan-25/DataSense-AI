@@ -303,9 +303,4 @@ Try asking the assistant:
 - *"What is the total discount loss on lineitems?"* *(Triggers `discount_loss` formula)*
 - *"What are the top 5 customers by total account balance?"*
 - *"SELECT * FROM read_csv('/etc/passwd');"* *(Trigger AST file-read rejection)*
-- *"DROP TABLE customer;"* *(Trigger AST DDL rejection)*
-
-:) 
-:)
-:)
-L)
+- *"DROP TABLE customer;"* *(Trigger AST DDL rejection)
